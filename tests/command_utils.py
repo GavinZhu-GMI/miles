@@ -4,11 +4,12 @@ import os
 import random
 import subprocess
 from pathlib import Path
+from typing import Optional
 
 repo_base_dir = Path(os.path.abspath(__file__)).resolve().parents[1]
 
 
-def convert_checkpoint(model_name, model_type):
+def convert_checkpoint(model_name, model_type, num_gpus: int):
     # TODO shall we make it in host-mapped folder and thus can cache it to speedup CI
     path_dst = f"/root/{model_name}_torch_dist"
     if Path(path_dst).exists():
@@ -17,18 +18,24 @@ def convert_checkpoint(model_name, model_type):
 
     exec_command(
         f"source {repo_base_dir}/scripts/models/{model_type}.sh && "
-        "PYTHONPATH=/root/Megatron-LM torchrun --nproc-per-node 8 tools/convert_hf_to_torch_dist.py "
+        f"PYTHONPATH=/root/Megatron-LM torchrun --nproc-per-node {num_gpus} tools/convert_hf_to_torch_dist.py "
         "${MODEL_ARGS[@]} "
         f"--hf-checkpoint /root/models/{model_name} "
         f"--save {path_dst}"
     )
 
 
+def hf_download_dataset(full_name: str):
+    _, partial_name = full_name.split("/")
+    exec_command(f"hf download --repo-type dataset {full_name} --local-dir /root/datasets/{partial_name}")
+
+
 def execute_train(
     train_args: str,
     num_gpus: int,
-    model_type: str,
+    model_type: Optional[str],
     master_addr: str = "127.0.0.1",
+    train_script: str = "train.py",
 ):
     exec_command(
         "pkill -9 sglang; "
@@ -64,14 +71,17 @@ def execute_train(
         }
     )
 
+    source_cmd = f'source "{repo_base_dir}/scripts/models/{model_type}.sh" && ' if model_type is not None else ""
+    model_args_str = "${MODEL_ARGS[@]}" if model_type is not None else ""
+
     exec_command(
         f"export PYTHONBUFFERED=16 && "
-        f'source "{repo_base_dir}/scripts/models/{model_type}.sh" && '
+        f"{source_cmd}"
         # TODO should this 127.0.0.1 be `master_addr` instead
         f'ray job submit --address="http://127.0.0.1:8265" '
         f"--runtime-env-json='{runtime_env_json}' "
-        "-- python3 train.py "
-        "${MODEL_ARGS[@]} "
+        f"-- python3 {train_script} "
+        f"{model_args_str} "
         f"{train_args}"
     )
 

@@ -37,6 +37,10 @@ jobs:
         info:
           - {test_file: test_quick_start_glm4_9B.py, num_gpus: 8}
           - {test_file: test_qwen3_30B_A3B.py, num_gpus: 8}
+          - {test_file: test_qwen2.5_0.5B_gsm8k.py, num_gpus: 2}
+          - {test_file: test_qwen2.5_0.5B_gsm8k_async.py, num_gpus: 2}
+          - {test_file: test_qwen3_0.6B_fsdp_colocated_2xGPU.py, num_gpus: 2}
+          - {test_file: test_qwen3_0.6B_fsdp_distributed.py, num_gpus: 2}
           # TODO use deterministic kernel
     defaults:
       run:
