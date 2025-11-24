@@ -199,7 +199,7 @@ class MegatronTrainRayActor(TrainRayActor):
         # Move RL fields to GPU if they exist and are not already on GPU
         # This is needed for external APIs (like Tinker) that provide pre-computed RL fields
         # In normal miles training, these fields come from GPU forward passes and don't need moving
-        if getattr(self.args, "move_rl_fields_to_gpu", False):
+        if self.args.move_rl_fields_to_gpu:
             for field in ["log_probs", "ref_log_probs", "advantages", "returns", "values"]:
                 if field in rollout_data and rollout_data[field]:
                     # Check if first tensor is already on GPU to avoid unnecessary transfers
