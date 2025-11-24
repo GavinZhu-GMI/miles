@@ -203,7 +203,7 @@ class MegatronTrainRayActor(TrainRayActor):
             for field in ["log_probs", "ref_log_probs", "advantages", "returns", "values"]:
                 if field in rollout_data and rollout_data[field]:
                     # Check if first tensor is already on GPU to avoid unnecessary transfers
-                    first_tensor = rollout_data[field][0]
+                    first_tensor = value[0]
                     if isinstance(first_tensor, torch.Tensor) and not first_tensor.is_cuda:
                         rollout_data[field] = [
                             torch.tensor(t, dtype=torch.float32, device=torch.cuda.current_device())
