@@ -507,7 +507,8 @@ def policy_loss_function(
         pg_loss = pg_loss * opsm_mask
 
     # Apply off-policy correction using importance sampling if enabled
-    rollout_log_probs_list = None
+    # Needed for Tinker SFT support (tinker sft may omit rollout log-probs)
+    rollout_log_probs_list = None  
     if "rollout_log_probs" in batch and batch["rollout_log_probs"]:
         filtered = [lp for lp in batch["rollout_log_probs"] if lp is not None]
         if filtered:
