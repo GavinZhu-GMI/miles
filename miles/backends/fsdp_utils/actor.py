@@ -32,6 +32,22 @@ from .update_weight_utils import UpdateWeightFromDistributed, UpdateWeightFromTe
 logger = logging.getLogger(__name__)
 
 
+def _align_tensor(tensor: torch.Tensor, target_len: int) -> torch.Tensor:
+    """Trim/pad a 1D tensor to target_len with right alignment."""
+    if target_len <= 0:
+        return tensor.new_zeros(0)
+    if tensor.shape[0] > target_len:
+        return tensor[-target_len:]
+    if tensor.shape[0] < target_len:
+        pad = torch.zeros(
+            target_len - tensor.shape[0],
+            dtype=tensor.dtype,
+            device=tensor.device,
+        )
+        return torch.cat([pad, tensor], dim=0)
+    return tensor
+
+
 class FSDPTrainRayActor(TrainRayActor):
     """Simplified TrainRayActor for pure HF+FSDP training.
 
@@ -496,11 +512,36 @@ class FSDPTrainRayActor(TrainRayActor):
 
         unpacked_batches = unpack_sequences(packed_batch)
 
-        old_log_probs = torch.cat([batch["log_probs"] for batch in unpacked_batches], dim=0)
-        log_probs = torch.cat([batch["cur_log_probs"] for batch in unpacked_batches], dim=0)
-        advantages = torch.cat([batch["advantages"] for batch in unpacked_batches], dim=0)
-        loss_masks = [batch["loss_masks"].to(device=log_probs.device) for batch in unpacked_batches]
-        response_lengths = [batch["response_lengths"] for batch in unpacked_batches]
+        device = logits.device
+        aligned_old: list[torch.Tensor] = []
+        aligned_new: list[torch.Tensor] = []
+        aligned_advantages: list[torch.Tensor] = []
+        aligned_loss_masks: list[torch.Tensor] = []
+        response_lengths: list[int] = []
+        aligned_rollout: list[torch.Tensor] = []
+
+        for batch in unpacked_batches:
+            mask = batch["loss_masks"].to(device=device)
+            length = int(mask.sum().item())
+            if length <= 0:
+                continue
+
+            old_lp = batch["log_probs"].to(device=device)
+            new_lp = batch["cur_log_probs"].to(device=device)
+            aligned_old.append(_align_tensor(old_lp, length))
+            aligned_new.append(_align_tensor(new_lp, length))
+            aligned_advantages.append(_align_tensor(batch["advantages"].to(device=device), length))
+            aligned_rollout.append(_align_tensor(batch["rollout_log_probs"].to(device=device), length))
+            aligned_loss_masks.append(mask[:length])
+            response_lengths.append(length)
+
+        if not aligned_old:
+            return
+
+        old_log_probs = torch.cat(aligned_old, dim=0)
+        log_probs = torch.cat(aligned_new, dim=0)
+        advantages = torch.cat(aligned_advantages, dim=0)
+        loss_masks = aligned_loss_masks
 
         advantages = advantages.to(device=log_probs.device)
         ppo_kl = old_log_probs.to(device=log_probs.device) - log_probs
@@ -521,7 +562,7 @@ class FSDPTrainRayActor(TrainRayActor):
 
         pg_loss, pg_clipfrac = compute_policy_loss(ppo_kl, advantages, self.args.eps_clip, self.args.eps_clip_high)
 
-        rollout_log_probs = torch.cat([batch["rollout_log_probs"] for batch in unpacked_batches], dim=0)
+        rollout_log_probs = torch.cat(aligned_rollout, dim=0)
 
         # Apply TIS before sample mean calculation
         if self.args.use_tis:

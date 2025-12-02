@@ -21,6 +21,38 @@ from miles.utils.types import RolloutBatch
 from .cp_utils import all_gather_with_cp, get_logits_and_tokens_offset_with_cp, get_sum_of_sample_mean
 
 
+def _align_logprob_pair(
+    old_log_prob: torch.Tensor,
+    new_log_prob: torch.Tensor,
+    target_len: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Trim/pad logprob tensors to the same target_len (right aligned)."""
+    if target_len <= 0:
+        return old_log_prob.new_zeros(0), new_log_prob.new_zeros(0)
+
+    if old_log_prob.shape[0] > target_len:
+        old_log_prob = old_log_prob[-target_len:]
+    elif old_log_prob.shape[0] < target_len:
+        pad = torch.zeros(
+            target_len - old_log_prob.shape[0],
+            dtype=old_log_prob.dtype,
+            device=old_log_prob.device,
+        )
+        old_log_prob = torch.cat([pad, old_log_prob], dim=0)
+
+    if new_log_prob.shape[0] > target_len:
+        new_log_prob = new_log_prob[-target_len:]
+    elif new_log_prob.shape[0] < target_len:
+        pad = torch.zeros(
+            target_len - new_log_prob.shape[0],
+            dtype=new_log_prob.dtype,
+            device=new_log_prob.device,
+        )
+        new_log_prob = torch.cat([pad, new_log_prob], dim=0)
+
+    return old_log_prob, new_log_prob
+
+
 def get_responses(
     logits: torch.Tensor,
     *,
@@ -404,82 +436,63 @@ def policy_loss_function(
     per_sample_log_probs = [lp.clone().detach() for lp in log_probs]
 
     if args.advantage_estimator == "gspo":
-        full_log_probs = [
-            all_gather_with_cp(log_prob, total_length, response_length)
-            for log_prob, total_length, response_length in zip(log_probs, total_lengths, response_lengths)
-        ]
-        full_old_log_probs = [
-            all_gather_with_cp(old_log_prob, total_length, response_length)
-            for old_log_prob, total_length, response_length in zip(old_log_probs, total_lengths, response_lengths)
-        ]
+        full_log_probs = []
+        full_old_log_probs = []
+        aligned_lengths = []
+        for log_prob, old_log_prob, total_length, response_length, loss_mask in zip(
+            log_probs,
+            old_log_probs,
+            total_lengths,
+            response_lengths,
+            batch["loss_masks"],
+        ):
+            gathered = all_gather_with_cp(log_prob, total_length, response_length)
+            gathered_old = all_gather_with_cp(old_log_prob, total_length, response_length)
+            length = int(loss_mask.sum().item()) if loss_mask is not None else int(response_length)
+            aligned_old, aligned_new = _align_logprob_pair(gathered_old, gathered, length)
+            full_log_probs.append(aligned_new)
+            full_old_log_probs.append(aligned_old)
+            aligned_lengths.append(length)
 
         loss_masks = batch["loss_masks"]
-        ppo_kl = [
-            ((old_logprob - log_prob) * loss_mask).sum() / torch.clamp_min(loss_mask.sum(), 1)
-            for log_prob, old_logprob, loss_mask in zip(full_log_probs, full_old_log_probs, loss_masks)
-        ]
-        ppo_kl = [kl.expand_as(log_prob) for kl, log_prob in zip(ppo_kl, log_probs)]
-        ppo_kl = torch.cat(ppo_kl, dim=0)
-        old_log_probs = torch.cat(old_log_probs, dim=0)
-        log_probs = torch.cat(log_probs, dim=0)
-    else:
-        old_log_probs = torch.cat(old_log_probs, dim=0)
-        log_probs = torch.cat(log_probs, dim=0)
-
-        if old_log_probs.shape != log_probs.shape:
-            # Align per-sample lengths using response lengths or loss masks before subtraction.
-            aligned_old: list[torch.Tensor] = []
-            aligned_new: list[torch.Tensor] = []
-            offset = 0
-            loss_masks = batch.get("loss_masks", None)
-
-            for idx, response_length in enumerate(response_lengths):
-                length = int(response_length)
-
-                if loss_masks and idx < len(loss_masks) and loss_masks[idx] is not None:
-                    # loss_mask already accounts for variable-length responses
-                    length = int(loss_masks[idx].sum().item())
-
-                if length <= 0:
-                    continue
-
-                old_slice = old_log_probs[offset : offset + length]
-                new_slice = log_probs[offset : offset + length]
-
-                # Trim/pad slices to the target length
-                if new_slice.shape[0] < length:
-                    pad = torch.zeros(
-                        length - new_slice.shape[0],
-                        dtype=new_slice.dtype,
-                        device=new_slice.device,
-                    )
-                    new_slice = torch.cat([pad, new_slice], dim=0)
-                elif new_slice.shape[0] > length:
-                    new_slice = new_slice[-length:]
-
-                if old_slice.shape[0] < length:
-                    pad = torch.zeros(
-                        length - old_slice.shape[0],
-                        dtype=old_slice.dtype,
-                        device=old_slice.device,
-                    )
-                    old_slice = torch.cat([pad, old_slice], dim=0)
-                elif old_slice.shape[0] > length:
-                    old_slice = old_slice[-length:]
-
-                aligned_old.append(old_slice)
-                aligned_new.append(new_slice)
-                offset += length
-
-            if aligned_old and aligned_new:
-                old_log_probs = torch.cat(aligned_old, dim=0)
-                log_probs = torch.cat(aligned_new, dim=0)
+        ppo_kl = []
+        for log_prob, old_logprob, loss_mask in zip(full_log_probs, full_old_log_probs, loss_masks):
+            mask = loss_mask
+            length = log_prob.shape[0]
+            if mask is None:
+                mask = torch.ones(length, device=log_prob.device, dtype=log_prob.dtype)
             else:
-                logger.warning(
-                    "Failed to align log_probs shapes (old=%s, new=%s); proceeding with original tensors",
-                    old_log_probs.shape,
-                    log_probs.shape,
-                )
+                mask = mask[:length].to(log_prob.dtype)
+            denom = torch.clamp_min(mask.sum(), 1)
+            ppo_kl.append(((old_logprob - log_prob) * mask).sum() / denom)
+        ppo_kl = [kl.expand_as(log_prob) for kl, log_prob in zip(ppo_kl, full_log_probs)]
+        ppo_kl = torch.cat(ppo_kl, dim=0)
+        old_log_probs = torch.cat(full_old_log_probs, dim=0)
+        log_probs = torch.cat(full_log_probs, dim=0)
+    else:
+        aligned_old: list[torch.Tensor] = []
+        aligned_new: list[torch.Tensor] = []
+        loss_masks = batch.get("loss_masks", None)
+
+        for idx, (old_lp, new_lp, response_length) in enumerate(zip(old_log_probs, log_probs, response_lengths)):
+            length = int(response_length)
+            if loss_masks and idx < len(loss_masks) and loss_masks[idx] is not None:
+                length = int(loss_masks[idx].sum().item())
+
+            aligned_old_lp, aligned_new_lp = _align_logprob_pair(old_lp, new_lp, length)
+            if aligned_old_lp.numel() == 0:
+                continue
+
+            aligned_old.append(aligned_old_lp)
+            aligned_new.append(aligned_new_lp)
+
+        if not aligned_old:
+            logger.warning("No aligned log_probs produced; falling back to raw concatenation")
+            aligned_old = [torch.cat(old_log_probs, dim=0)]
+            aligned_new = [torch.cat(log_probs, dim=0)]
+
+        old_log_probs = torch.cat(aligned_old, dim=0)
+        log_probs = torch.cat(aligned_new, dim=0)
 
         ppo_kl = old_log_probs - log_probs
 
