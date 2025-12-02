@@ -229,4 +229,7 @@ def process_rollout_data(args, rollout_data_ref, dp_rank, dp_size):
         val = get_partition(data[key])
         rollout_data[key] = val
 
+    if "_actual_global_batch_size" in data:
+        rollout_data["_actual_global_batch_size"] = data["_actual_global_batch_size"]
+
     return rollout_data

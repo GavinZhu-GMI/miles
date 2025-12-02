@@ -252,7 +252,8 @@ def get_data_iterator(
         num_steps_per_rollout = (num_local_samples + num_local_gbs - 1) // num_local_gbs
 
     # Track the effective batch size (used later for loss scaling)
-    rollout_data["_actual_global_batch_size"] = num_local_samples * dp_size
+    if "_actual_global_batch_size" not in rollout_data:
+        rollout_data["_actual_global_batch_size"] = num_local_samples * dp_size
 
     def _generate_data_iterator(rollout_data, micro_batch_size, micro_batch_indices=None):
         data_iterator = []
