@@ -695,10 +695,14 @@ def sft_loss_function(
     Computes log-probabilities of the ground-truth tokens in the response
     segments and returns the negative log-likelihood as the loss.
 
+    If loss_masks contain non-binary values (weights), the loss becomes a
+    weighted sum: -sum(weights * log_probs). This supports DPO's
+    forward_backward_custom where gradients are passed as weights.
+
     Args:
         args: Configuration (passed through to helpers).
-        batch: Mini-batch with "unconcat_tokens", "response_lengths", and
-            "total_lengths".
+        batch: Mini-batch with "unconcat_tokens", "response_lengths",
+            "total_lengths", and optionally "loss_masks" for weighted loss.
         logits: Policy logits with shape `[1, T, V]`.
         sum_of_sample_mean: Reduction function that averages per-sample values.
 
@@ -708,6 +712,7 @@ def sft_loss_function(
     """
     response_lengths = batch["response_lengths"]
     total_lengths = batch["total_lengths"]
+    loss_masks = batch.get("loss_masks")
 
     log_probs_and_entropy = get_log_probs_and_entropy(
         logits,
@@ -720,12 +725,33 @@ def sft_loss_function(
 
     log_probs = log_probs_and_entropy["log_probs"]
     per_sample_log_probs = [lp.clone().detach() for lp in log_probs]
-    log_probs = torch.cat(log_probs, dim=0)
-    loss = -sum_of_sample_mean(log_probs)
+
+    # Check if loss_masks contain weights (non-binary values like gradients for DPO)
+    # If so, compute weighted loss: -sum(weights * log_probs)
+    if loss_masks is not None:
+        # Apply per-sample weights
+        weighted_log_probs = []
+        for lp, mask in zip(log_probs, loss_masks):
+            # Align lengths - mask and log_probs should match
+            min_len = min(len(lp), len(mask))
+            if min_len > 0:
+                # Use the last min_len elements (response portion)
+                weighted_lp = lp[-min_len:] * mask[-min_len:]
+                weighted_log_probs.append(weighted_lp)
+
+        if weighted_log_probs:
+            all_weighted = torch.cat(weighted_log_probs, dim=0)
+            loss = -all_weighted.sum()
+        else:
+            log_probs_cat = torch.cat(log_probs, dim=0)
+            loss = -sum_of_sample_mean(log_probs_cat)
+    else:
+        log_probs_cat = torch.cat(log_probs, dim=0)
+        loss = -sum_of_sample_mean(log_probs_cat)
 
     # make sure the gradient could backprop correctly.
-    if log_probs.numel() == 0:
-        loss += 0 * logits.sum()
+    if len(log_probs) == 0 or all(lp.numel() == 0 for lp in log_probs):
+        loss = loss + 0 * logits.sum()
 
     return (
         loss,
@@ -782,7 +808,10 @@ def loss_function(
         "sum_of_sample_mean": sum_of_sample_mean,
     }
 
-    match args.loss_type:
+    # Allow per-request loss type override (for DPO forward_backward_custom)
+    loss_type = batch.get("_loss_type_override", args.loss_type)
+
+    match loss_type:
         case "policy_loss":
             loss, log = policy_loss_function(**loss_function_kwargs)
         case "value_loss":
