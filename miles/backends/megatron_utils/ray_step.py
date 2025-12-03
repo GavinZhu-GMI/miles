@@ -48,6 +48,7 @@ def _build_forward_step_fn(actor, args, num_microbatches):
                 "advantages",
                 "returns",
                 "rollout_log_probs",
+                "_loss_type_override",  # For DPO forward_backward_custom
             ],
         )
 
