@@ -469,7 +469,7 @@ class MegatronTrainRayActor(TrainRayActor):
         """
         Run forward/backward pass without optimizer step to enable gradient accumulation.
         """
-        Timer().end("train_wait")
+        Timer().end_if_started("train_wait")
 
         if self.args.offload_train:
             self.wake_up()
@@ -499,7 +499,7 @@ class MegatronTrainRayActor(TrainRayActor):
         """
         Run forward-only inference to fetch per-sample log probabilities (used by DPO/DPM adapters).
         """
-        Timer().end("train_wait")
+        Timer().end_if_started("train_wait")
 
         if self.args.offload_train:
             self.wake_up()

@@ -31,6 +31,11 @@ class Timer(metaclass=SingletonMeta):
         if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
             logger.info(f"Timer {name} end (elapsed: {elapsed_time:.1f}s)")
 
+    def end_if_started(self, name):
+        """End timer only if it was started. Safe to call when timer may not be running."""
+        if name in self.start_time:
+            self.end(name)
+
     def reset(self, name=None):
         if name is None:
             self.timers = {}
