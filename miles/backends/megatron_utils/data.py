@@ -100,6 +100,9 @@ def get_batch(
         # DPO forward_backward_custom loss type override
         if "_loss_type_override" in rollout_metadata:
             batch["_loss_type_override"] = rollout_metadata["_loss_type_override"]
+            logger.info(f"[get_batch] Set _loss_type_override to: {batch['_loss_type_override']}")
+        else:
+            logger.info(f"[get_batch] No _loss_type_override in rollout_metadata. Keys: {list(rollout_metadata.keys())}")
 
     return batch
 
