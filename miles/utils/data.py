@@ -232,4 +232,8 @@ def process_rollout_data(args, rollout_data_ref, dp_rank, dp_size):
     if "_actual_global_batch_size" in data:
         rollout_data["_actual_global_batch_size"] = data["_actual_global_batch_size"]
 
+    # DPO forward_backward_custom uses this to switch from policy_loss to sft_loss
+    if "_loss_type_override" in data:
+        rollout_data["_loss_type_override"] = data["_loss_type_override"]
+
     return rollout_data
