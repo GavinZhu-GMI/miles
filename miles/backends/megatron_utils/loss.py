@@ -1,3 +1,4 @@
+import logging
 from argparse import Namespace
 from collections.abc import Callable, Iterator
 from typing import Any
@@ -5,6 +6,8 @@ from typing import Any
 import torch
 from megatron.core import mpu
 from torch.utils.checkpoint import checkpoint
+
+logger = logging.getLogger(__name__)
 
 from miles.utils.distributed_utils import distributed_masked_whiten
 from miles.utils.misc import load_function
