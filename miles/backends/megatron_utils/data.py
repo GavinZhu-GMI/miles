@@ -91,10 +91,16 @@ def get_batch(
     batch["tokens"] = tokens
     batch["packed_seq_params"] = packed_seq_params
 
-    # Always propagate actual batch size if it exists on the rollout data (needed for variable batch sizes)
+    # Propagate scalar metadata from rollout_data (not per-sample, so not sliced by iterator)
     rollout_metadata = getattr(data_iterator, "rollout_data", None)
-    if rollout_metadata and "_actual_global_batch_size" in rollout_metadata:
-        batch["_actual_global_batch_size"] = rollout_metadata["_actual_global_batch_size"]
+    if rollout_metadata:
+        # Variable batch size support
+        if "_actual_global_batch_size" in rollout_metadata:
+            batch["_actual_global_batch_size"] = rollout_metadata["_actual_global_batch_size"]
+        # DPO forward_backward_custom loss type override
+        if "_loss_type_override" in rollout_metadata:
+            batch["_loss_type_override"] = rollout_metadata["_loss_type_override"]
+
     return batch
 
 
