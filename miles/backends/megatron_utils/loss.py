@@ -97,7 +97,9 @@ def get_responses(
         if cp_size == 1:
             end += total_length
             start = end - response_length
-            logits_chunk = logits[start - 1 : end - 1]
+            # When response_length == total_length, start=0 and logits[-1:] wraps incorrectly.
+            # Use max(0, start - 1) to handle the edge case where entire sequence is response.
+            logits_chunk = logits[max(0, start - 1) : end - 1]
             tokens_chunk = tokens[-response_length:]
         else:
             # TODO: this is super ugly... do better abstraction.
