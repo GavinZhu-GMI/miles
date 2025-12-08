@@ -97,10 +97,15 @@ def get_responses(
         if cp_size == 1:
             end += total_length
             start = end - response_length
-            # When response_length == total_length, start=0 and logits[-1:] wraps incorrectly.
-            # Use max(0, start - 1) to handle the edge case where entire sequence is response.
-            logits_chunk = logits[max(0, start - 1) : end - 1]
-            tokens_chunk = tokens[-response_length:]
+            # When response_length == total_length, start=0 and we get 1 fewer logit than tokens.
+            # The first token has no logit predicting it (logits[i] predicts tokens[i+1]).
+            # Align both slices to (N-1) elements by skipping the first token.
+            if start == 0:
+                logits_chunk = logits[:end - 1]      # logits[0:N-1] = N-1 elements
+                tokens_chunk = tokens[1:]             # Skip first token = N-1 elements
+            else:
+                logits_chunk = logits[start - 1 : end - 1]
+                tokens_chunk = tokens[-response_length:]
         else:
             # TODO: this is super ugly... do better abstraction.
             chunk_size, chunks_offset, logits_offset, tokens_offset = get_logits_and_tokens_offset_with_cp(
