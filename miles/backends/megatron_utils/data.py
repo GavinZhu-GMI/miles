@@ -306,7 +306,9 @@ def get_data_iterator(
             start = i * num_local_gbs
             end = min(start + num_local_gbs, num_local_samples)
             samples = rollout_data["total_lengths"][start:end]
-            partitions = get_seqlen_balanced_partitions(samples, num_mbs, equal_size=False)
+            # Force equal_size=True when partial rollout or dynamic sampling is enabled to prevent advantages/log_probs length mismatch
+            use_equal_size = getattr(args, "partial_rollout", False) or getattr(args, "dynamic_sampling_filter_path", None) is not None
+            partitions = get_seqlen_balanced_partitions(samples, num_mbs, equal_size=use_equal_size)
             for j in range(num_mbs):
                 for k in range(len(partitions[j])):
                     partitions[j][k] += start

@@ -427,7 +427,7 @@ def policy_loss_function(
         "tis", "ois", "tis_clipfrac" are included when the respective features
         are enabled.
     """
-    advantages = torch.cat(batch["advantages"], dim=0)
+    advantages_list = batch["advantages"]  # Will be aligned later if needed
     old_log_probs = batch["rollout_log_probs"] if args.use_rollout_logprobs else batch["log_probs"]
 
     response_lengths = batch["response_lengths"]
@@ -479,12 +479,16 @@ def policy_loss_function(
         ppo_kl = torch.cat(ppo_kl, dim=0)
         old_log_probs = torch.cat(full_old_log_probs, dim=0)
         log_probs = torch.cat(full_log_probs, dim=0)
+        # For GSPO, align advantages to the aligned lengths
+        aligned_advantages = [adv[:length] for adv, length in zip(advantages_list, aligned_lengths)]
+        advantages = torch.cat(aligned_advantages, dim=0)
     else:
         aligned_old: list[torch.Tensor] = []
+        aligned_advantages: list[torch.Tensor] = []
         aligned_new: list[torch.Tensor] = []
         loss_masks = batch.get("loss_masks", None)
 
-        for idx, (old_lp, new_lp, response_length) in enumerate(zip(old_log_probs, log_probs, response_lengths)):
+        for idx, (old_lp, new_lp, adv, response_length) in enumerate(zip(old_log_probs, log_probs, advantages_list, response_lengths)):
             length = int(response_length)
             if loss_masks and idx < len(loss_masks) and loss_masks[idx] is not None:
                 length = int(loss_masks[idx].sum().item())
@@ -494,18 +498,29 @@ def policy_loss_function(
                 continue
 
             aligned_old.append(aligned_old_lp)
+            # Use aligned length to match log_probs shape
+            aligned_len = aligned_old_lp.shape[0]
+            if adv.shape[0] >= aligned_len:
+                aligned_advantages.append(adv[-aligned_len:])  # Right-align like log_probs
+            else:
+                # Pad if advantages is shorter
+                pad = torch.zeros(aligned_len - adv.shape[0], dtype=adv.dtype, device=adv.device)
+                aligned_advantages.append(torch.cat([pad, adv], dim=0))
             aligned_new.append(aligned_new_lp)
 
         if not aligned_old:
             logger.warning("No aligned log_probs produced; falling back to raw concatenation")
             aligned_old = [torch.cat(old_log_probs, dim=0)]
             aligned_new = [torch.cat(log_probs, dim=0)]
+            aligned_advantages = advantages_list  # Keep all advantages in fallback
 
         old_log_probs = torch.cat(aligned_old, dim=0)
         log_probs = torch.cat(aligned_new, dim=0)
 
         ppo_kl = old_log_probs - log_probs
+        advantages = torch.cat(aligned_advantages, dim=0)
 
+    logger.info(f"[DEBUG] ppo_kl shape: {ppo_kl.shape}, advantages shape: {advantages.shape}")
     pg_loss, pg_clipfrac = compute_policy_loss(ppo_kl, advantages, args.eps_clip, args.eps_clip_high)
 
     # Apply off-policy correction using importance sampling if enabled
