@@ -33,14 +33,19 @@ def prepare_model_inputs(prompt, tokenizer, processor=None, metadata=None, apply
             - input_ids: Token IDs for the prompt
             - extra_info: Dict with 'images', 'videos', 'multimodal_inputs' (or empty dict)
     """
-    tools = metadata.get("tools") if metadata else None
-    text_prompt = tokenizer.apply_chat_template(
-        prompt,
-        tools=tools,
-        tokenize=False,
-        add_generation_prompt=True,
-        **(apply_chat_template_kwargs or {}),
-    )
+    # If prompt is already a string (e.g., TinyZero preprocessor), use it directly
+    if isinstance(prompt, str):
+        text_prompt = prompt
+    else:
+        # Apply chat template for list of message dicts
+        tools = metadata.get("tools") if metadata else None
+        text_prompt = tokenizer.apply_chat_template(
+            prompt,
+            tools=tools,
+            tokenize=False,
+            add_generation_prompt=True,
+            **(apply_chat_template_kwargs or {}),
+        )
 
     if not processor:
         input_ids = tokenizer.encode(text_prompt, add_special_tokens=False)
