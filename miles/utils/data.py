@@ -53,6 +53,7 @@ class Dataset:
         tokenizer,
         max_length,
         *,
+        processor=None,
         prompt_key="text",
         multimodal_keys=None,
         label_key=None,
@@ -62,6 +63,7 @@ class Dataset:
         apply_chat_template=False,
         apply_chat_template_kwargs=None,
     ):
+        self.processor = processor
         self.origin_samples = []
         for data in read_file(path):
             if multimodal_keys:
