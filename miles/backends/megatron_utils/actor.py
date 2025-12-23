@@ -134,6 +134,10 @@ class MegatronTrainRayActor(TrainRayActor):
         # empty cache after initialization
         clear_memory()
 
+        # Track sleep state for idempotent sleep/wake_up calls
+        # Needed for Tinker API where multiple forward/forward_backward calls may happen
+        self._is_sleeping = False
+
         if self.args.offload_train:
             # recover to actor in the end.
             self._switch_model("actor")
@@ -155,6 +159,10 @@ class MegatronTrainRayActor(TrainRayActor):
     def sleep(self) -> None:
         assert self.args.offload_train
 
+        # Idempotent: skip if already sleeping
+        if getattr(self, '_is_sleeping', False):
+            return
+
         clear_memory(clear_host_memory=True)
         print_memory("before offload model")
         destroy_process_groups()
@@ -162,10 +170,16 @@ class MegatronTrainRayActor(TrainRayActor):
         torch_memory_saver.pause()
 
         print_memory("after offload model")
+        self._is_sleeping = True
 
     @timer
     def wake_up(self) -> None:
         assert self.args.offload_train
+
+        # Idempotent: skip if already awake
+        if not getattr(self, '_is_sleeping', True):
+            return
+
         print_memory("before wake_up model")
 
         torch_memory_saver.resume()
@@ -173,6 +187,7 @@ class MegatronTrainRayActor(TrainRayActor):
         clear_memory()
         reload_process_groups()
         print_memory("after wake_up model")
+        self._is_sleeping = False
 
     def _get_rollout_data(self, rollout_data_ref: Box) -> RolloutBatch:
         # Fetch data through ray on CPU, not sure if this will be performance bottleneck.
