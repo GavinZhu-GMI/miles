@@ -251,6 +251,8 @@ def get_data_iterator(
 
     num_local_samples = len(rollout_data["total_lengths"])
 
+    print(f"[MILES DEBUG] get_data_iterator: num_local_samples={num_local_samples}, dp_size={dp_size}, global_batch_size={args.global_batch_size}", flush=True)
+
     # FLEXIBLE BATCH SIZE: support variable batch sizes (e.g., when driven by external APIs like Tinker)
     target_local_batch_size = args.global_batch_size // dp_size
     if num_local_samples <= target_local_batch_size:
@@ -259,6 +261,8 @@ def get_data_iterator(
     else:
         num_local_gbs = target_local_batch_size
         num_steps_per_rollout = (num_local_samples + num_local_gbs - 1) // num_local_gbs
+
+    print(f"[MILES DEBUG] target_local_batch_size={target_local_batch_size}, num_local_gbs={num_local_gbs}, num_steps_per_rollout={num_steps_per_rollout}", flush=True)
 
     # Track the effective batch size (used later for loss scaling)
     if "_actual_global_batch_size" not in rollout_data:
@@ -315,6 +319,8 @@ def get_data_iterator(
         assert len(set(sum(micro_batch_indices, []))) == num_local_samples
 
         data_iterator = _generate_data_iterator(rollout_data, None, micro_batch_indices)
+
+    print(f"[MILES DEBUG] FINAL num_microbatches={num_microbatches}, use_dynamic_batch_size={args.use_dynamic_batch_size}", flush=True)
 
     return (
         data_iterator,

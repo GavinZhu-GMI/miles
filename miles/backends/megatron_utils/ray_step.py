@@ -22,11 +22,17 @@ from .loss import get_log_probs_and_entropy, loss_function
 from .model import forward_only
 
 
-def _build_forward_step_fn(actor, args, num_microbatches):
+def _build_forward_step_fn(actor, args, num_microbatches_for_step):
     """
     Build the forward_step_fn closure used by Megatron's pipeline engine.
 
     This is shared by the training path and the forward_backward_only helper.
+
+    Args:
+        actor: The training actor
+        args: Megatron args
+        num_microbatches_for_step: Number of microbatches for THIS gradient accumulation step
+                                   (scalar, not the full list)
     """
 
     def forward_step(
@@ -124,14 +130,23 @@ def _build_forward_step_fn(actor, args, num_microbatches):
         if old_stage is not None:
             os.environ["ROUTING_REPLAY_STAGE"] = old_stage
 
-        return output_tensor, partial(loss_function, args, batch, num_microbatches[0])
+        return output_tensor, partial(loss_function, args, batch, num_microbatches_for_step)
 
     return forward_step
 
 
 def run_forward_backward_only(actor, rollout_id, data_iterator, num_microbatches, zero_grads):
-    """Execute forward/backward without optimizer.step() for gradient accumulation."""
+    """Execute forward/backward without optimizer.step() for gradient accumulation.
+
+    This function handles multiple gradient accumulation steps when batch size exceeds
+    global_batch_size. It loops over all steps in num_microbatches and aggregates
+    losses and logprobs from all steps.
+    """
     args = get_args()
+    num_steps = len(num_microbatches)
+    total_microbatches = sum(num_microbatches)
+    print(f"[MILES DEBUG] run_forward_backward_only: num_microbatches={num_microbatches}, "
+          f"num_steps={num_steps}, total_microbatches={total_microbatches}", flush=True)
 
     if zero_grads:
         for model_chunk in actor.model:
@@ -144,18 +159,30 @@ def run_forward_backward_only(actor, rollout_id, data_iterator, num_microbatches
         custom_before_train_step_hook = load_function(args.custom_megatron_before_train_step_hook_path)
         custom_before_train_step_hook(args, rollout_id, 0, actor.model, actor.optimizer, actor.opt_param_scheduler)
 
-    forward_step = _build_forward_step_fn(actor, args, num_microbatches)
     forward_backward_func = get_forward_backward_func()
-    losses_reduced = forward_backward_func(
-        forward_step_func=forward_step,
-        data_iterator=data_iterator,
-        model=actor.model,
-        num_microbatches=num_microbatches[0],
-        seq_length=args.seq_length,
-        micro_batch_size=args.micro_batch_size,
-        decoder_seq_length=args.decoder_seq_length,
-        forward_only=False,
-    )
+
+    # Aggregate results across all gradient accumulation steps
+    all_losses_reduced = []
+
+    for step_id in range(num_steps):
+        num_mbs = num_microbatches[step_id]
+        print(f"[MILES DEBUG] Step {step_id}/{num_steps}: num_microbatches={num_mbs}", flush=True)
+
+        # Build forward_step_fn with the correct microbatch count for this step
+        forward_step = _build_forward_step_fn(actor, args, num_mbs)
+
+        losses_reduced = forward_backward_func(
+            forward_step_func=forward_step,
+            data_iterator=data_iterator,
+            model=actor.model,
+            num_microbatches=num_mbs,
+            seq_length=args.seq_length,
+            micro_batch_size=args.micro_batch_size,
+            decoder_seq_length=args.decoder_seq_length,
+            forward_only=False,
+        )
+        all_losses_reduced.extend(losses_reduced)
+        print(f"[MILES DEBUG] Step {step_id}: got {len(losses_reduced)} loss entries", flush=True)
 
     valid_step = True
     grad_norm = None
@@ -172,9 +199,10 @@ def run_forward_backward_only(actor, rollout_id, data_iterator, num_microbatches
 
     loss_dict: Dict[str, float | list[torch.Tensor]] = {}
     if mpu.is_pipeline_last_stage(ignore_virtual=True):
-        keys = losses_reduced[0]["keys"]
+        # Aggregate losses from all steps
+        keys = all_losses_reduced[0]["keys"]
         values = None
-        for item in losses_reduced:
+        for item in all_losses_reduced:
             if values is None:
                 values = item["values"]
             else:
@@ -187,11 +215,16 @@ def run_forward_backward_only(actor, rollout_id, data_iterator, num_microbatches
         for key, value in zip(keys, values[1:]):
             loss_dict[key] = value * mpu.get_context_parallel_world_size() / num_samples_or_tokens
 
-        if "log_probs" in losses_reduced[0]:
+        # Aggregate logprobs from ALL steps (not just first)
+        if "log_probs" in all_losses_reduced[0]:
             all_log_probs = []
-            for entry in losses_reduced:
+            print(f"[MILES DEBUG] all_losses_reduced has {len(all_losses_reduced)} entries (across {num_steps} steps)", flush=True)
+            for idx, entry in enumerate(all_losses_reduced):
+                lp = entry.get("log_probs", [])
+                print(f"[MILES DEBUG] Entry {idx}: log_probs count = {len(lp) if lp else 0}", flush=True)
                 if "log_probs" in entry and entry["log_probs"]:
                     all_log_probs.extend(entry["log_probs"])
+            print(f"[MILES DEBUG] Total all_log_probs: {len(all_log_probs)}", flush=True)
             if all_log_probs:
                 loss_dict["log_probs"] = all_log_probs
 
