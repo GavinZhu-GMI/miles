@@ -483,6 +483,11 @@ class MegatronTrainRayActor(TrainRayActor):
     ) -> Dict[str, float]:
         """
         Run forward/backward pass without optimizer step to enable gradient accumulation.
+
+        When use_rollout_logprobs=False (default), this computes Megatron log_probs
+        BEFORE training, matching the behavior of train_actor(). This is necessary
+        for correct PPO ratio computation when using TIS or comparing against
+        Megatron-computed log_probs.
         """
         Timer().end_if_started("train_wait")
 
@@ -493,6 +498,21 @@ class MegatronTrainRayActor(TrainRayActor):
             rollout_data = self._get_rollout_data(rollout_data_ref)
 
         data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
+
+        # Compute Megatron log_probs BEFORE training (matching train_actor() behavior)
+        # This is needed when use_rollout_logprobs=False for correct PPO ratio computation.
+        # Without this, the PPO ratio would compare SGLang log_probs (from sampling)
+        # against Megatron log_probs (from training forward pass), causing bias.
+        if not self.args.use_rollout_logprobs or self.args.get_mismatch_metrics:
+            with timer("compute_log_probs"):
+                log_probs_result = self.compute_log_prob(
+                    data_iterator,
+                    num_microbatches,
+                    store_prefix="",
+                )
+                rollout_data.update(log_probs_result)
+                # Rebuild data_iterator since rollout_data was updated
+                data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
 
         with timer("forward_backward_only"):
             loss_dict, grad_norm, valid_step = run_forward_backward_only(

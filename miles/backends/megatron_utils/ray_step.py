@@ -141,12 +141,24 @@ def run_forward_backward_only(actor, rollout_id, data_iterator, num_microbatches
     This function handles multiple gradient accumulation steps when batch size exceeds
     global_batch_size. It loops over all steps in num_microbatches and aggregates
     losses and logprobs from all steps.
+
+    IMPORTANT: When using dynamic batch sizing with sequence-length balancing,
+    samples are reordered for efficiency. This function reorders logprobs back
+    to original sample order before returning.
     """
     args = get_args()
     num_steps = len(num_microbatches)
     total_microbatches = sum(num_microbatches)
     print(f"[MILES DEBUG] run_forward_backward_only: num_microbatches={num_microbatches}, "
           f"num_steps={num_steps}, total_microbatches={total_microbatches}", flush=True)
+
+    # Get processing order for reordering logprobs later
+    # data_iterator is a list of DataIterator (one per VPP stage)
+    processing_order = None
+    if data_iterator and len(data_iterator) > 0:
+        processing_order = data_iterator[0].get_processing_order()
+        if processing_order is not None:
+            print(f"[MILES DEBUG] Processing order (first 10): {processing_order[:10]}...", flush=True)
 
     if zero_grads:
         for model_chunk in actor.model:
@@ -201,6 +213,7 @@ def run_forward_backward_only(actor, rollout_id, data_iterator, num_microbatches
     if mpu.is_pipeline_last_stage(ignore_virtual=True):
         # Aggregate losses from all steps
         keys = all_losses_reduced[0]["keys"]
+        print(f"[MILES DEBUG] loss_dict keys from loss_function: {keys}", flush=True)
         values = None
         for item in all_losses_reduced:
             if values is None:
@@ -225,6 +238,29 @@ def run_forward_backward_only(actor, rollout_id, data_iterator, num_microbatches
                 if "log_probs" in entry and entry["log_probs"]:
                     all_log_probs.extend(entry["log_probs"])
             print(f"[MILES DEBUG] Total all_log_probs: {len(all_log_probs)}", flush=True)
+
+            # REORDER logprobs from processed order back to original sample order
+            # This is necessary because sequence-length balancing reorders samples
+            # for efficiency, but callers expect logprobs in original order.
+            if all_log_probs and processing_order is not None:
+                num_samples = len(all_log_probs)
+                if len(processing_order) == num_samples:
+                    # processing_order[processed_pos] = original_idx
+                    # We need: reordered[original_idx] = all_log_probs[processed_pos]
+                    reordered_log_probs = [None] * num_samples
+                    for processed_pos, original_idx in enumerate(processing_order):
+                        reordered_log_probs[original_idx] = all_log_probs[processed_pos]
+
+                    # Verify no None entries (all samples accounted for)
+                    if all(lp is not None for lp in reordered_log_probs):
+                        all_log_probs = reordered_log_probs
+                        print(f"[MILES DEBUG] Reordered {num_samples} logprobs from processed to original order", flush=True)
+                    else:
+                        print(f"[MILES DEBUG] WARNING: Some logprobs missing after reorder, keeping processed order", flush=True)
+                else:
+                    print(f"[MILES DEBUG] WARNING: processing_order len ({len(processing_order)}) != "
+                          f"logprobs len ({num_samples}), keeping processed order", flush=True)
+
             if all_log_probs:
                 loss_dict["log_probs"] = all_log_probs
 
@@ -232,7 +268,17 @@ def run_forward_backward_only(actor, rollout_id, data_iterator, num_microbatches
 
 
 def run_forward_only(actor, data_iterator, num_microbatches):
-    """Forward-only pass to collect log-probs/entropy for DPO-style flows."""
+    """Forward-only pass to collect log-probs/entropy for DPO-style flows.
+
+    IMPORTANT: When using dynamic batch sizing with sequence-length balancing,
+    samples are reordered for efficiency. This function reorders logprobs back
+    to original sample order before returning.
+    """
+    # Get processing order for reordering logprobs later
+    processing_order = None
+    if data_iterator and len(data_iterator) > 0:
+        processing_order = data_iterator[0].get_processing_order()
+
     rollout_data_result = forward_only(
         get_log_probs_and_entropy,
         actor.args,
@@ -243,9 +289,38 @@ def run_forward_only(actor, data_iterator, num_microbatches):
     )
 
     loss_dict: Dict[str, list[torch.Tensor]] = {}
-    if mpu.is_pipeline_last_stage():
+    # Only TP rank 0 at pipeline-last stage returns log_probs to avoid duplicates
+    # across TP ranks (all TP ranks have identical values due to all-reduce).
+    # This is important for external APIs (opentinker-miles) that aggregate results.
+    if mpu.is_pipeline_last_stage() and mpu.get_tensor_model_parallel_rank() == 0:
         if "log_probs" in rollout_data_result:
-            loss_dict["log_probs"] = rollout_data_result["log_probs"]
+            # Move to CPU to avoid device mismatch when aggregated across actors
+            log_probs_list = [lp.cpu() for lp in rollout_data_result["log_probs"]]
+
+            # REORDER logprobs from processed order back to original sample order
+            if log_probs_list and processing_order is not None:
+                num_samples = len(log_probs_list)
+                if len(processing_order) == num_samples:
+                    reordered = [None] * num_samples
+                    for processed_pos, original_idx in enumerate(processing_order):
+                        reordered[original_idx] = log_probs_list[processed_pos]
+                    if all(lp is not None for lp in reordered):
+                        log_probs_list = reordered
+                        print(f"[MILES DEBUG] run_forward_only: Reordered {num_samples} logprobs to original order", flush=True)
+
+            loss_dict["log_probs"] = log_probs_list
         if "entropy" in rollout_data_result:
-            loss_dict["entropy"] = rollout_data_result["entropy"]
+            entropy_list = [e.cpu() for e in rollout_data_result["entropy"]]
+
+            # REORDER entropy from processed order back to original sample order
+            if entropy_list and processing_order is not None:
+                num_samples = len(entropy_list)
+                if len(processing_order) == num_samples:
+                    reordered = [None] * num_samples
+                    for processed_pos, original_idx in enumerate(processing_order):
+                        reordered[original_idx] = entropy_list[processed_pos]
+                    if all(e is not None for e in reordered):
+                        entropy_list = reordered
+
+            loss_dict["entropy"] = entropy_list
     return loss_dict

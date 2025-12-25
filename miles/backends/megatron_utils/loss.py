@@ -1,7 +1,7 @@
 import logging
 from argparse import Namespace
 from collections.abc import Callable, Iterator
-from typing import Any
+from typing import Any, Dict, Tuple
 
 import torch
 from megatron.core import mpu
@@ -449,6 +449,19 @@ def policy_loss_function(
         "tis", "ois", "tis_clipfrac" are included when the respective features
         are enabled.
     """
+    # Debug: ALWAYS log what's in batch for log_probs and rollout_log_probs
+    print(f"[POLICY DEBUG] batch keys: {list(batch.keys())}", flush=True)
+    lp = batch.get("log_probs")
+    rlp = batch.get("rollout_log_probs")
+    print(f"[POLICY DEBUG] log_probs is {'None' if lp is None else 'empty' if not lp else f'{len(lp)} samples'}", flush=True)
+    print(f"[POLICY DEBUG] rollout_log_probs is {'None' if rlp is None else 'empty' if not rlp else f'{len(rlp)} samples'}", flush=True)
+    if lp:
+        lp_sizes = [t.shape[0] if t is not None else 0 for t in lp]
+        print(f"[POLICY DEBUG] log_probs sizes: {lp_sizes}, total={sum(lp_sizes)}", flush=True)
+    if rlp:
+        rlp_sizes = [t.shape[0] if t is not None else 0 for t in rlp]
+        print(f"[POLICY DEBUG] rollout_log_probs sizes: {rlp_sizes}, total={sum(rlp_sizes)}", flush=True)
+
     advantages = torch.cat(batch["advantages"], dim=0)
     old_log_probs = batch["rollout_log_probs"] if args.use_rollout_logprobs else batch["log_probs"]
 
@@ -599,10 +612,29 @@ def policy_loss_function(
                 loss_masks: list[torch.Tensor],
                 **kwargs: Any,
             ) -> Tuple[torch.Tensor, list[torch.Tensor], Dict[str, torch.Tensor]]:
-                rollout_log_probs = torch.cat(rollout_log_probs, dim=0)
-                old_log_probs = torch.cat(train_log_probs, dim=0)
-                tis = torch.exp(old_log_probs - rollout_log_probs)
-                tis_abs = torch.exp((old_log_probs - rollout_log_probs).abs())
+                # Debug: Check sizes before concatenation
+                train_sizes = [lp.shape[0] for lp in train_log_probs]
+                rollout_sizes = [lp.shape[0] for lp in rollout_log_probs]
+                logger.warning(
+                    f"[TIS DEBUG] train_log_probs: {len(train_log_probs)} samples, sizes={train_sizes[:5]}..., "
+                    f"total={sum(train_sizes)}"
+                )
+                logger.warning(
+                    f"[TIS DEBUG] rollout_log_probs: {len(rollout_log_probs)} samples, sizes={rollout_sizes[:5]}..., "
+                    f"total={sum(rollout_sizes)}"
+                )
+
+                rollout_lp_cat = torch.cat(rollout_log_probs, dim=0)
+                train_lp_cat = torch.cat(train_log_probs, dim=0)
+
+                if rollout_lp_cat.shape != train_lp_cat.shape:
+                    logger.error(
+                        f"[TIS ERROR] Size mismatch! train={train_lp_cat.shape[0]}, rollout={rollout_lp_cat.shape[0]}. "
+                        f"Train sample count={len(train_log_probs)}, Rollout sample count={len(rollout_log_probs)}"
+                    )
+
+                tis = torch.exp(train_lp_cat - rollout_lp_cat)
+                tis_abs = torch.exp((train_lp_cat - rollout_lp_cat).abs())
                 tis_weights = torch.clamp(tis, min=args.tis_clip_low, max=args.tis_clip)
                 tis_clipfrac = (tis_weights != tis).float()
                 metrics = {

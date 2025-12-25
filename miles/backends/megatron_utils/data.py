@@ -51,6 +51,19 @@ def get_batch(
     assert "tokens" in keys
     batch = data_iterator.get_next(keys)
 
+    # Debug: ALWAYS log what keys are requested and what's in batch
+    print(f"[GET_BATCH DEBUG] requested keys: {keys}", flush=True)
+    lp = batch.get("log_probs")
+    rlp = batch.get("rollout_log_probs")
+    print(f"[GET_BATCH DEBUG] log_probs: {'None' if lp is None else 'empty' if not lp else f'{len(lp)} samples'}", flush=True)
+    print(f"[GET_BATCH DEBUG] rollout_log_probs: {'None' if rlp is None else 'empty' if not rlp else f'{len(rlp)} samples'}", flush=True)
+    if lp:
+        lp_sizes = [t.shape[0] if t is not None else 0 for t in lp]
+        print(f"[GET_BATCH DEBUG] log_probs sizes: {lp_sizes}, total={sum(lp_sizes)}", flush=True)
+    if rlp:
+        rlp_sizes = [t.shape[0] if t is not None else 0 for t in rlp]
+        print(f"[GET_BATCH DEBUG] rollout_log_probs sizes: {rlp_sizes}, total={sum(rlp_sizes)}", flush=True)
+
     packed_seq_params = None
     tokens = batch["tokens"]
     # use 0 as the pad token id should be fine?
@@ -217,6 +230,23 @@ class DataIterator:
         self.offset = 0
         return self
 
+    def get_processing_order(self) -> list[int] | None:
+        """Return the flattened order in which samples are processed.
+
+        When using dynamic batch sizing with sequence-length balancing,
+        samples are reordered to balance token counts across microbatches.
+        This method returns the mapping from processed position to original
+        sample index.
+
+        Returns:
+            None if using contiguous microbatches (no reordering).
+            List of original indices in processing order if using micro_batch_indices.
+            E.g., [2, 3, 0, 1] means: first we process sample 2, then 3, then 0, then 1.
+        """
+        if self.micro_batch_indices is None:
+            return None
+        return [idx for partition in self.micro_batch_indices for idx in partition]
+
 
 def get_data_iterator(
     args: Namespace,
@@ -250,6 +280,16 @@ def get_data_iterator(
     cp_size = mpu.get_context_parallel_world_size()
 
     num_local_samples = len(rollout_data["total_lengths"])
+
+    # Debug: Check initial rollout_data sizes
+    if "log_probs" in rollout_data and rollout_data["log_probs"]:
+        lp_sizes = [lp.shape[0] if lp is not None else 0 for lp in rollout_data["log_probs"]]
+        print(f"[DATA_ITER DEBUG] INITIAL rollout_data['log_probs']: {len(rollout_data['log_probs'])} samples, sizes={lp_sizes[:10]}..., total={sum(lp_sizes)}", flush=True)
+    if "rollout_log_probs" in rollout_data and rollout_data["rollout_log_probs"]:
+        rlp_sizes = [lp.shape[0] if lp is not None else 0 for lp in rollout_data["rollout_log_probs"]]
+        print(f"[DATA_ITER DEBUG] INITIAL rollout_data['rollout_log_probs']: {len(rollout_data['rollout_log_probs'])} samples, sizes={rlp_sizes[:10]}..., total={sum(rlp_sizes)}", flush=True)
+    if "response_lengths" in rollout_data and rollout_data["response_lengths"]:
+        print(f"[DATA_ITER DEBUG] INITIAL response_lengths: {rollout_data['response_lengths'][:10]}..., total={sum(rollout_data['response_lengths'])}", flush=True)
 
     print(f"[MILES DEBUG] get_data_iterator: num_local_samples={num_local_samples}, dp_size={dp_size}, global_batch_size={args.global_batch_size}", flush=True)
 
