@@ -167,3 +167,14 @@ class RayTrainGroup:
         Apply optimizer step after manual gradient accumulation.
         """
         return ray.get([actor.apply_optimizer_step.remote() for actor in self._actor_handlers])
+
+    def apply_optimizer_step_and_sync(self):
+        """
+        Apply optimizer step and sync weights to SGLang.
+
+        Combines apply_optimizer_step() + update_weights() for Tinker API use case
+        where we always want to sync weights after training before next sample().
+        """
+        results = self.apply_optimizer_step()
+        self.update_weights()
+        return results
