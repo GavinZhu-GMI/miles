@@ -285,4 +285,12 @@ def process_rollout_data(args, rollout_data_ref, dp_rank, dp_size):
     if "_loss_type_override" in data:
         rollout_data["_loss_type_override"] = data["_loss_type_override"]
 
+    # Store the original indices this DP rank is responsible for
+    # Used by actor_group._aggregate_dp_results() to reorder logprobs to original order
+    total_samples = len(data["tokens"])
+    if args.balance_data:
+        rollout_data["_dp_original_indices"] = parititions[dp_rank]
+    else:
+        rollout_data["_dp_original_indices"] = list(range(dp_rank, total_samples, dp_size))
+
     return rollout_data

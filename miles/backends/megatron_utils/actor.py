@@ -528,6 +528,8 @@ class MegatronTrainRayActor(TrainRayActor):
             "loss": loss_dict,
             "grad_norm": grad_norm if grad_norm is not None else 0.0,
             "valid_step": valid_step,
+            # Return DP partition indices for correct result aggregation
+            "_dp_original_indices": rollout_data.get("_dp_original_indices", []),
         }
 
     def forward_only_step(self, rollout_id: int, rollout_data_ref: Box) -> Dict[str, Dict[str, list[torch.Tensor]]]:

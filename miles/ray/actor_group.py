@@ -146,13 +146,89 @@ class RayTrainGroup:
     def forward_backward_only(self, rollout_id, rollout_data_ref, zero_grads=False):
         """
         Run forward/backward without optimizer step to accumulate gradients (Tinker API support).
+
+        Returns a single aggregated result dict with logprobs interleaved to original input order.
         """
-        return ray.get(
+        raw_results = ray.get(
             [
                 actor.forward_backward_step_only.remote(rollout_id, rollout_data_ref, zero_grads)
                 for actor in self._actor_handlers
             ]
         )
+        return self._aggregate_dp_results(raw_results)
+
+    def _aggregate_dp_results(self, results):
+        """
+        Aggregate per-actor results, reordering logprobs to restore original sample order.
+
+        With DP (data parallel), each actor processes a subset of samples. The subset
+        can be either:
+        - Strided pattern (balance_data=False): Actor 0 gets [0, 2, 4, ...], Actor 1 gets [1, 3, 5, ...]
+        - Group-aware balanced (balance_data=True): Groups kept together, balanced by token count
+
+        Each actor returns `_dp_original_indices` indicating which global sample indices
+        it processed. This method uses those indices to reorder logprobs to original order,
+        making the caller DP-agnostic.
+
+        Args:
+            results: List of result dicts from each actor
+
+        Returns:
+            Single aggregated result dict with logprobs in original order
+        """
+        # Collect logprobs and partition indices from actors that have them (pipeline last stage only)
+        dp_results_with_logprobs = []
+        dp_original_indices = []
+        result_with_loss = None
+
+        for result in results:
+            loss_dict = result.get("loss", {})
+            if loss_dict.get("log_probs"):
+                dp_results_with_logprobs.append(loss_dict["log_probs"])
+                dp_original_indices.append(result.get("_dp_original_indices", []))
+            if loss_dict.get("loss") is not None:
+                result_with_loss = result
+
+        # Reorder logprobs to original sample order using partition indices
+        if len(dp_results_with_logprobs) > 1:
+            # Calculate total samples from partition indices
+            total_samples = sum(len(indices) for indices in dp_original_indices)
+            reordered = [None] * total_samples
+
+            for indices, lp_list in zip(dp_original_indices, dp_results_with_logprobs):
+                if len(indices) != len(lp_list):
+                    # Fallback: indices don't match logprobs, use as-is with warning
+                    print(f"[WARNING] _aggregate_dp_results: indices len ({len(indices)}) != logprobs len ({len(lp_list)})", flush=True)
+                    continue
+                for local_idx, (original_idx, logprob) in enumerate(zip(indices, lp_list)):
+                    if original_idx < total_samples:
+                        reordered[original_idx] = logprob
+
+            # Filter out any None entries (shouldn't happen with correct indices)
+            all_logprobs = [lp for lp in reordered if lp is not None]
+            if len(all_logprobs) != total_samples:
+                print(f"[WARNING] _aggregate_dp_results: missing logprobs after reorder "
+                      f"({len(all_logprobs)}/{total_samples})", flush=True)
+        elif dp_results_with_logprobs:
+            all_logprobs = dp_results_with_logprobs[0]
+        else:
+            all_logprobs = []
+
+        # Build aggregated result
+        if result_with_loss:
+            loss_dict = dict(result_with_loss.get("loss", {}))  # Copy to avoid mutating original
+            loss_dict["log_probs"] = all_logprobs
+            return {
+                "loss": loss_dict,
+                "grad_norm": result_with_loss.get("grad_norm", 0.0),
+                "valid_step": result_with_loss.get("valid_step", True),
+            }
+        else:
+            return {
+                "loss": {"log_probs": all_logprobs},
+                "grad_norm": 0.0,
+                "valid_step": True,
+            }
 
     def forward_only(self, rollout_id, rollout_data_ref):
         """
