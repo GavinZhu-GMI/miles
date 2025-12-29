@@ -463,21 +463,30 @@ def policy_loss_function(
         print(f"[POLICY DEBUG] rollout_log_probs sizes: {rlp_sizes}, total={sum(rlp_sizes)}", flush=True)
 
     advantages = torch.cat(batch["advantages"], dim=0)
+
+    # DEBUG: Log advantage values for alignment verification
+    import os
+    if os.environ.get("DEBUG_ADVANTAGES"):
+        print(f"[ADVANTAGE DEBUG] advantages shape: {advantages.shape}", flush=True)
+        print(f"[ADVANTAGE DEBUG] advantages[:10]: {advantages[:10].tolist()}", flush=True)
+        print(f"[ADVANTAGE DEBUG] advantages mean: {advantages.mean().item():.6f}", flush=True)
+        print(f"[ADVANTAGE DEBUG] advantages std: {advantages.std().item():.6f}", flush=True)
+        # Also log per-sample advantage values (first value per sample)
+        per_sample_advs = [batch["advantages"][i][0].item() for i in range(min(8, len(batch["advantages"])))]
+        print(f"[ADVANTAGE DEBUG] per-sample advantages[:8]: {per_sample_advs}", flush=True)
+
     old_log_probs = batch["rollout_log_probs"] if args.use_rollout_logprobs else batch["log_probs"]
 
     response_lengths = batch["response_lengths"]
     total_lengths = batch["total_lengths"]
 
-    # Detect if advantages are full-size (opentinker-miles) or CP-local (direct Miles)
-    # opentinker-miles sends full-size advantages from client; direct Miles computes CP-local advantages
-    # This detection is needed for correct sum_of_sample_mean behavior with CP > 1
-    advantage_total = sum(a.shape[0] for a in batch["advantages"])
-    response_total = sum(response_lengths)
-    advantages_are_full_size = (advantage_total == response_total)
+    # Tinker sends full-size tensors (logprobs, advantages, etc.)
+    # Native RLVE has CP-local tensors - no gathering needed
+    with_tinker = batch.get("_with_tinker", False)
 
     # DEBUG: Print CP fix detection
     cp_size_debug = mpu.get_context_parallel_world_size()
-    print(f"[CP FIX DEBUG] cp_size={cp_size_debug}, advantages_are_full_size={advantages_are_full_size}", flush=True)
+    print(f"[CP FIX DEBUG] cp_size={cp_size_debug}, with_tinker={with_tinker}", flush=True)
 
     # DEBUG: Print batch info for shape diagnosis
     adv_sizes = [a.shape[0] for a in batch["advantages"]]
@@ -551,7 +560,7 @@ def policy_loss_function(
     else:
         # When CP > 1 AND advantages are full-size, gather log_probs to match
         cp_size = mpu.get_context_parallel_world_size()
-        if cp_size > 1 and advantages_are_full_size:
+        if cp_size > 1 and with_tinker:
             # Gather to full length before concatenating
             old_log_probs = [
                 all_gather_with_cp(old_lp, total_length, response_length)
@@ -681,9 +690,10 @@ def policy_loss_function(
         if filtered:
             rollout_log_probs_list = filtered
 
-    # When CP > 1, gather rollout_log_probs to match full sequence length
+    # When CP > 1 AND advantages are full-size (opentinker-miles), gather rollout_log_probs
+    # to match full sequence length. For native RLVE (advantages CP-local), keep as CP-local.
     cp_size = mpu.get_context_parallel_world_size()
-    if rollout_log_probs_list and cp_size > 1:
+    if rollout_log_probs_list and cp_size > 1 and with_tinker:
         rollout_log_probs_list = [
             all_gather_with_cp(rlp, total_length, response_length)
             for rlp, total_length, response_length in zip(
@@ -766,7 +776,7 @@ def policy_loss_function(
             # [decouple IS and rejection] Rebuild sum_of_sample_mean with modified_response_masks for denominator correction
             # When advantages are full-size (opentinker-miles), use full response_lengths
             # Otherwise, get_sum_of_sample_mean will use CP-local chunk lengths
-            if advantages_are_full_size:
+            if with_tinker:
                 def sum_of_sample_mean_tis(x: torch.Tensor) -> torch.Tensor:
                     return sum(
                         [

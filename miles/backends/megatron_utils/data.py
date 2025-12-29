@@ -116,6 +116,9 @@ def get_batch(
             logger.info(f"[get_batch] Set _loss_type_override to: {batch['_loss_type_override']}")
         else:
             logger.info(f"[get_batch] No _loss_type_override in rollout_metadata. Keys: {list(rollout_metadata.keys())}")
+        # Tinker flag for CP handling (full-size tensors from client)
+        if "_with_tinker" in rollout_metadata:
+            batch["_with_tinker"] = rollout_metadata["_with_tinker"]
 
     return batch
 

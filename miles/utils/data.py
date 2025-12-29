@@ -201,13 +201,39 @@ def process_rollout_data(args, rollout_data_ref, dp_rank, dp_size):
 
     rank = dist.get_rank()
     if rank == 0:
-        data = ray.get(rollout_data_ref.inner)
+        # Handle both list (upstream) and single Box (legacy) formats
+        if isinstance(rollout_data_ref, list):
+            # Upstream format: list of pre-partitioned Box objects
+            assert len(rollout_data_ref) == dp_size, f"Expected {dp_size} partitions, got {len(rollout_data_ref)}"
+            data = ray.get(rollout_data_ref[dp_rank].inner)
+        else:
+            # Legacy format: single Box with all data
+            data = ray.get(rollout_data_ref.inner)
         dist.broadcast_object_list([data], src=0)
     else:
         data = [None]
         dist.broadcast_object_list(data, src=0)
         data = data[0]
 
+    # Check if data was pre-partitioned by upstream's _split_train_data_by_dp()
+    # If so, data already contains only this rank's samples
+    if "partition" in data:
+        partition = data.pop("partition")
+        total_lengths = data["total_lengths"]
+        Timer().seq_lens = total_lengths
+
+        # Data is already partitioned - copy as-is
+        rollout_data = data
+
+        # Fix total_lengths to be partition-specific (for seqlen calculation)
+        rollout_data["total_lengths"] = [total_lengths[i] for i in partition]
+
+        # Add _dp_original_indices for opentinker-miles logprobs reordering
+        rollout_data["_dp_original_indices"] = list(partition)
+
+        return rollout_data
+
+    # Legacy path: data is not pre-partitioned, do partitioning here
     # save the unprocessed reward for logging (optional for forward-only passes)
     if "raw_reward" in data:
         rollout_data["raw_reward"] = data["raw_reward"]
