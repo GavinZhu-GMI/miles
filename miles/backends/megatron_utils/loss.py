@@ -468,6 +468,29 @@ def policy_loss_function(
     response_lengths = batch["response_lengths"]
     total_lengths = batch["total_lengths"]
 
+    # Detect if advantages are full-size (opentinker-miles) or CP-local (direct Miles)
+    # opentinker-miles sends full-size advantages from client; direct Miles computes CP-local advantages
+    # This detection is needed for correct sum_of_sample_mean behavior with CP > 1
+    advantage_total = sum(a.shape[0] for a in batch["advantages"])
+    response_total = sum(response_lengths)
+    advantages_are_full_size = (advantage_total == response_total)
+
+    # DEBUG: Print CP fix detection
+    cp_size_debug = mpu.get_context_parallel_world_size()
+    print(f"[CP FIX DEBUG] cp_size={cp_size_debug}, advantages_are_full_size={advantages_are_full_size}", flush=True)
+
+    # DEBUG: Print batch info for shape diagnosis
+    adv_sizes = [a.shape[0] for a in batch["advantages"]]
+    print(f"[LOSS DEBUG] batch['advantages'] sizes: {adv_sizes}, total={sum(adv_sizes)}", flush=True)
+    print(f"[LOSS DEBUG] advantages (concat): shape={advantages.shape}", flush=True)
+    print(f"[LOSS DEBUG] response_lengths: {response_lengths}, sum={sum(response_lengths)}", flush=True)
+    print(f"[LOSS DEBUG] total_lengths: {total_lengths}, sum={sum(total_lengths)}", flush=True)
+    if hasattr(old_log_probs, '__len__') and not isinstance(old_log_probs, torch.Tensor):
+        olp_sizes = [lp.shape[0] if lp is not None else 0 for lp in old_log_probs]
+        print(f"[LOSS DEBUG] old_log_probs (list) sizes: {olp_sizes}, total={sum(olp_sizes)}", flush=True)
+    elif isinstance(old_log_probs, torch.Tensor):
+        print(f"[LOSS DEBUG] old_log_probs (tensor) shape: {old_log_probs.shape}", flush=True)
+
     log_probs_and_entropy = get_log_probs_and_entropy(
         logits,
         args=args,
@@ -479,6 +502,10 @@ def policy_loss_function(
 
     log_probs = log_probs_and_entropy["log_probs"]
     per_sample_log_probs = [lp.clone().detach() for lp in log_probs]
+
+    # DEBUG: Print computed log_probs sizes
+    computed_lp_sizes = [lp.shape[0] for lp in log_probs]
+    print(f"[LOSS DEBUG] log_probs (from get_log_probs_and_entropy) sizes: {computed_lp_sizes}, total={sum(computed_lp_sizes)}", flush=True)
 
     # Pre-gather log probs if needed by OPSM or GSPO to avoid duplicate gathering
     need_full_log_probs = args.use_opsm or args.advantage_estimator == "gspo"
@@ -517,9 +544,65 @@ def policy_loss_function(
             local_log_probs=log_probs,
             loss_masks=batch["loss_masks"],
         )
+        # For GSPO, full_log_probs is already gathered - use it for TIS
+        gathered_per_sample_log_probs = full_log_probs
         old_log_probs = torch.cat(old_log_probs, dim=0)
         log_probs = torch.cat(log_probs, dim=0)
     else:
+        # When CP > 1 AND advantages are full-size, gather log_probs to match
+        cp_size = mpu.get_context_parallel_world_size()
+        if cp_size > 1 and advantages_are_full_size:
+            # Gather to full length before concatenating
+            old_log_probs = [
+                all_gather_with_cp(old_lp, total_length, response_length)
+                for old_lp, total_length, response_length in zip(
+                    old_log_probs, total_lengths, response_lengths, strict=False
+                )
+            ]
+            log_probs = [
+                all_gather_with_cp(lp, total_length, response_length)
+                for lp, total_length, response_length in zip(
+                    log_probs, total_lengths, response_lengths, strict=False
+                )
+            ]
+
+            # Also gather entropy to match full sequence length
+            entropy_list = log_probs_and_entropy["entropy"]
+            log_probs_and_entropy["entropy"] = [
+                all_gather_with_cp(ent, total_length, response_length)
+                for ent, total_length, response_length in zip(
+                    entropy_list, total_lengths, response_lengths, strict=False
+                )
+            ]
+
+            # DEBUG: Print sizes after CP gathering
+            gathered_lp_sizes = [lp.shape[0] for lp in log_probs]
+            gathered_olp_sizes = [olp.shape[0] for olp in old_log_probs]
+            gathered_ent_sizes = [e.shape[0] for e in log_probs_and_entropy["entropy"]]
+            print(f"[CP FIX DEBUG] AFTER GATHERING: log_probs sizes: {gathered_lp_sizes}, total={sum(gathered_lp_sizes)}", flush=True)
+            print(f"[CP FIX DEBUG] AFTER GATHERING: old_log_probs sizes: {gathered_olp_sizes}, total={sum(gathered_olp_sizes)}", flush=True)
+            print(f"[CP FIX DEBUG] AFTER GATHERING: entropy sizes: {gathered_ent_sizes}, total={sum(gathered_ent_sizes)}", flush=True)
+            print(f"[CP FIX DEBUG] Using sum_of_sample_mean_full (rebuilt for full response_lengths)", flush=True)
+
+            # After gathering, tensors are full-size - recreate sum_of_sample_mean for full response_lengths
+            # The passed-in sum_of_sample_mean uses CP-local chunk lengths, which won't work for gathered tensors
+            loss_masks_for_sum = batch["loss_masks"]
+
+            def sum_of_sample_mean_full(x: torch.Tensor) -> torch.Tensor:
+                return sum(
+                    [
+                        (x_i * loss_mask_i).sum() / torch.clamp_min(loss_mask_i.sum(), 1)
+                        for x_i, loss_mask_i in zip(
+                            x.split(response_lengths, dim=0), loss_masks_for_sum, strict=False
+                        )
+                    ]
+                )
+
+            sum_of_sample_mean = sum_of_sample_mean_full
+
+        # Save gathered per-sample log_probs for TIS before concatenating
+        gathered_per_sample_log_probs = log_probs
+
         old_log_probs = torch.cat(old_log_probs, dim=0)
         log_probs = torch.cat(log_probs, dim=0)
 
@@ -580,6 +663,11 @@ def policy_loss_function(
 
         ppo_kl = old_log_probs - log_probs
 
+    # DEBUG: Print shapes right before compute_policy_loss (where the error occurs)
+    print(f"[LOSS DEBUG] BEFORE compute_policy_loss: ppo_kl.shape={ppo_kl.shape}, advantages.shape={advantages.shape}", flush=True)
+    if ppo_kl.shape[0] != advantages.shape[0]:
+        print(f"[LOSS DEBUG] *** SHAPE MISMATCH DETECTED! ppo_kl has {ppo_kl.shape[0]} elements, advantages has {advantages.shape[0]} elements ***", flush=True)
+
     pg_loss, pg_clipfrac = compute_policy_loss(ppo_kl, advantages, args.eps_clip, args.eps_clip_high)
 
     if args.use_opsm:
@@ -587,11 +675,24 @@ def policy_loss_function(
 
     # Apply off-policy correction using importance sampling if enabled
     # Needed for Tinker SFT support (tinker sft may omit rollout log-probs)
-    rollout_log_probs_list = None  
+    rollout_log_probs_list = None
     if "rollout_log_probs" in batch and batch["rollout_log_probs"]:
         filtered = [lp for lp in batch["rollout_log_probs"] if lp is not None]
         if filtered:
             rollout_log_probs_list = filtered
+
+    # When CP > 1, gather rollout_log_probs to match full sequence length
+    cp_size = mpu.get_context_parallel_world_size()
+    if rollout_log_probs_list and cp_size > 1:
+        rollout_log_probs_list = [
+            all_gather_with_cp(rlp, total_length, response_length)
+            for rlp, total_length, response_length in zip(
+                rollout_log_probs_list, total_lengths, response_lengths, strict=False
+            )
+        ]
+        # DEBUG: Print rollout_log_probs sizes after CP gathering
+        gathered_rlp_sizes = [rlp.shape[0] for rlp in rollout_log_probs_list]
+        print(f"[CP FIX DEBUG] AFTER GATHERING: rollout_log_probs sizes: {gathered_rlp_sizes}, total={sum(gathered_rlp_sizes)}", flush=True)
 
     if args.get_mismatch_metrics or args.use_tis:
         if rollout_log_probs_list is None:
@@ -649,7 +750,7 @@ def policy_loss_function(
             tis_kwargs = {
                 "args": args,
                 "pg_loss": pg_loss,
-                "train_log_probs": batch["log_probs"],
+                "train_log_probs": gathered_per_sample_log_probs,  # Use gathered version for CP > 1
                 "rollout_log_probs": rollout_log_probs_list,
                 "loss_masks": batch["loss_masks"],
                 "total_lengths": total_lengths,
@@ -663,10 +764,23 @@ def policy_loss_function(
             pg_loss, modified_response_masks, tis_metrics = tis_func(**tis_kwargs)
 
             # [decouple IS and rejection] Rebuild sum_of_sample_mean with modified_response_masks for denominator correction
-            # modified_response_masks will be sliced with cp in get_sum_of_sample_mean
-            sum_of_sample_mean = get_sum_of_sample_mean(
-                total_lengths, response_lengths, modified_response_masks, args.calculate_per_token_loss
-            )
+            # When advantages are full-size (opentinker-miles), use full response_lengths
+            # Otherwise, get_sum_of_sample_mean will use CP-local chunk lengths
+            if advantages_are_full_size:
+                def sum_of_sample_mean_tis(x: torch.Tensor) -> torch.Tensor:
+                    return sum(
+                        [
+                            (x_i * loss_mask_i).sum() / torch.clamp_min(loss_mask_i.sum(), 1)
+                            for x_i, loss_mask_i in zip(
+                                x.split(response_lengths, dim=0), modified_response_masks, strict=False
+                            )
+                        ]
+                    )
+                sum_of_sample_mean = sum_of_sample_mean_tis
+            else:
+                sum_of_sample_mean = get_sum_of_sample_mean(
+                    total_lengths, response_lengths, modified_response_masks, args.calculate_per_token_loss
+                )
         else:
             tis_metrics = {}
             ois = torch.tensor(0.0, device=log_probs.device)

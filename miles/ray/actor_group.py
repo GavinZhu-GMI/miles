@@ -191,24 +191,36 @@ class RayTrainGroup:
 
         # Reorder logprobs to original sample order using partition indices
         if len(dp_results_with_logprobs) > 1:
-            # Calculate total samples from partition indices
-            total_samples = sum(len(indices) for indices in dp_original_indices)
-            reordered = [None] * total_samples
+            # Check if all actors have identical indices (DP=1 case where multiple
+            # actors on same DP rank return logprobs, e.g., with PP>1 or TP>1)
+            indices_are_identical = all(
+                dp_original_indices[i] == dp_original_indices[0]
+                for i in range(1, len(dp_original_indices))
+            )
 
-            for indices, lp_list in zip(dp_original_indices, dp_results_with_logprobs):
-                if len(indices) != len(lp_list):
-                    # Fallback: indices don't match logprobs, use as-is with warning
-                    print(f"[WARNING] _aggregate_dp_results: indices len ({len(indices)}) != logprobs len ({len(lp_list)})", flush=True)
-                    continue
-                for local_idx, (original_idx, logprob) in enumerate(zip(indices, lp_list)):
-                    if original_idx < total_samples:
-                        reordered[original_idx] = logprob
+            if indices_are_identical:
+                # All actors processed same samples (DP=1) - use first actor's logprobs only
+                # This happens when TP=2, PP=2 and both TP ranks on last PP stage return logprobs
+                all_logprobs = dp_results_with_logprobs[0]
+            else:
+                # Different DP ranks processed different samples - reorder to original order
+                total_samples = sum(len(indices) for indices in dp_original_indices)
+                reordered = [None] * total_samples
 
-            # Filter out any None entries (shouldn't happen with correct indices)
-            all_logprobs = [lp for lp in reordered if lp is not None]
-            if len(all_logprobs) != total_samples:
-                print(f"[WARNING] _aggregate_dp_results: missing logprobs after reorder "
-                      f"({len(all_logprobs)}/{total_samples})", flush=True)
+                for indices, lp_list in zip(dp_original_indices, dp_results_with_logprobs):
+                    if len(indices) != len(lp_list):
+                        # Fallback: indices don't match logprobs, use as-is with warning
+                        print(f"[WARNING] _aggregate_dp_results: indices len ({len(indices)}) != logprobs len ({len(lp_list)})", flush=True)
+                        continue
+                    for local_idx, (original_idx, logprob) in enumerate(zip(indices, lp_list)):
+                        if original_idx < total_samples:
+                            reordered[original_idx] = logprob
+
+                # Filter out any None entries (shouldn't happen with correct indices)
+                all_logprobs = [lp for lp in reordered if lp is not None]
+                if len(all_logprobs) != total_samples:
+                    print(f"[WARNING] _aggregate_dp_results: missing logprobs after reorder "
+                          f"({len(all_logprobs)}/{total_samples})", flush=True)
         elif dp_results_with_logprobs:
             all_logprobs = dp_results_with_logprobs[0]
         else:
