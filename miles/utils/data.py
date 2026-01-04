@@ -252,6 +252,18 @@ def process_rollout_data(args, rollout_data_ref, dp_rank, dp_size):
         n_samples_per_prompt = getattr(args, "n_samples_per_prompt", 1)
         # Calculate group-level lengths (sum of lengths for each group)
         num_groups = len(total_lengths) // n_samples_per_prompt
+
+        # Defensive check: ensure we have enough groups for DP partitioning
+        # This prevents cryptic assertion errors in get_seqlen_balanced_partitions
+        if num_groups < dp_size:
+            raise ValueError(
+                f"Insufficient data for DP partitioning with balance_data=True: "
+                f"got {len(total_lengths)} samples ({num_groups} groups with "
+                f"n_samples_per_prompt={n_samples_per_prompt}), but need at least "
+                f"{dp_size * n_samples_per_prompt} samples for dp_size={dp_size}. "
+                f"This usually indicates the client sent an empty or undersized batch."
+            )
+
         group_lengths = []
         for i in range(num_groups):
             start_idx = i * n_samples_per_prompt
@@ -310,6 +322,10 @@ def process_rollout_data(args, rollout_data_ref, dp_rank, dp_size):
     # DPO forward_backward_custom uses this to switch from policy_loss to sft_loss
     if "_loss_type_override" in data:
         rollout_data["_loss_type_override"] = data["_loss_type_override"]
+
+    # Tinker flag for CP handling (full-size tensors from client)
+    if "_with_tinker" in data:
+        rollout_data["_with_tinker"] = data["_with_tinker"]
 
     # Store the original indices this DP rank is responsible for
     # Used by actor_group._aggregate_dp_results() to reorder logprobs to original order

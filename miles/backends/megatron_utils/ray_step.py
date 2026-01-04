@@ -149,8 +149,8 @@ def run_forward_backward_only(actor, rollout_id, data_iterator, num_microbatches
     args = get_args()
     num_steps = len(num_microbatches)
     total_microbatches = sum(num_microbatches)
-    print(f"[MILES DEBUG] run_forward_backward_only: num_microbatches={num_microbatches}, "
-          f"num_steps={num_steps}, total_microbatches={total_microbatches}", flush=True)
+    # print(f"[MILES DEBUG] run_forward_backward_only: num_microbatches={num_microbatches}, "
+    #       f"num_steps={num_steps}, total_microbatches={total_microbatches}", flush=True)
 
     # Get processing order for reordering logprobs later
     # data_iterator is a list of DataIterator (one per VPP stage)
@@ -158,7 +158,8 @@ def run_forward_backward_only(actor, rollout_id, data_iterator, num_microbatches
     if data_iterator and len(data_iterator) > 0:
         processing_order = data_iterator[0].get_processing_order()
         if processing_order is not None:
-            print(f"[MILES DEBUG] Processing order (first 10): {processing_order[:10]}...", flush=True)
+            # print(f"[MILES DEBUG] Processing order (first 10): {processing_order[:10]}...", flush=True)
+            pass
 
     if zero_grads:
         for model_chunk in actor.model:
@@ -178,7 +179,7 @@ def run_forward_backward_only(actor, rollout_id, data_iterator, num_microbatches
 
     for step_id in range(num_steps):
         num_mbs = num_microbatches[step_id]
-        print(f"[MILES DEBUG] Step {step_id}/{num_steps}: num_microbatches={num_mbs}", flush=True)
+        # print(f"[MILES DEBUG] Step {step_id}/{num_steps}: num_microbatches={num_mbs}", flush=True)
 
         # Build forward_step_fn with the correct microbatch count for this step
         forward_step = _build_forward_step_fn(actor, args, num_mbs)
@@ -194,7 +195,7 @@ def run_forward_backward_only(actor, rollout_id, data_iterator, num_microbatches
             forward_only=False,
         )
         all_losses_reduced.extend(losses_reduced)
-        print(f"[MILES DEBUG] Step {step_id}: got {len(losses_reduced)} loss entries", flush=True)
+        # print(f"[MILES DEBUG] Step {step_id}: got {len(losses_reduced)} loss entries", flush=True)
 
     valid_step = True
     grad_norm = None
@@ -210,10 +211,10 @@ def run_forward_backward_only(actor, rollout_id, data_iterator, num_microbatches
                 valid_step = not (math.isnan(grad_norm) or math.isinf(grad_norm))
 
     loss_dict: Dict[str, float | list[torch.Tensor]] = {}
-    if mpu.is_pipeline_last_stage(ignore_virtual=True):
+    if mpu.is_pipeline_last_stage(ignore_virtual=True) and mpu.get_tensor_model_parallel_rank() == 0:
         # Aggregate losses from all steps
         keys = all_losses_reduced[0]["keys"]
-        print(f"[MILES DEBUG] loss_dict keys from loss_function: {keys}", flush=True)
+        # print(f"[MILES DEBUG] loss_dict keys from loss_function: {keys}", flush=True)
         values = None
         for item in all_losses_reduced:
             if values is None:
@@ -231,13 +232,13 @@ def run_forward_backward_only(actor, rollout_id, data_iterator, num_microbatches
         # Aggregate logprobs from ALL steps (not just first)
         if "log_probs" in all_losses_reduced[0]:
             all_log_probs = []
-            print(f"[MILES DEBUG] all_losses_reduced has {len(all_losses_reduced)} entries (across {num_steps} steps)", flush=True)
+            # print(f"[MILES DEBUG] all_losses_reduced has {len(all_losses_reduced)} entries (across {num_steps} steps)", flush=True)
             for idx, entry in enumerate(all_losses_reduced):
                 lp = entry.get("log_probs", [])
-                print(f"[MILES DEBUG] Entry {idx}: log_probs count = {len(lp) if lp else 0}", flush=True)
+                # print(f"[MILES DEBUG] Entry {idx}: log_probs count = {len(lp) if lp else 0}", flush=True)
                 if "log_probs" in entry and entry["log_probs"]:
                     all_log_probs.extend(entry["log_probs"])
-            print(f"[MILES DEBUG] Total all_log_probs: {len(all_log_probs)}", flush=True)
+            # print(f"[MILES DEBUG] Total all_log_probs: {len(all_log_probs)}", flush=True)
 
             # REORDER logprobs from processed order back to original sample order
             # This is necessary because sequence-length balancing reorders samples
@@ -254,12 +255,14 @@ def run_forward_backward_only(actor, rollout_id, data_iterator, num_microbatches
                     # Verify no None entries (all samples accounted for)
                     if all(lp is not None for lp in reordered_log_probs):
                         all_log_probs = reordered_log_probs
-                        print(f"[MILES DEBUG] Reordered {num_samples} logprobs from processed to original order", flush=True)
+                        # print(f"[MILES DEBUG] Reordered {num_samples} logprobs from processed to original order", flush=True)
                     else:
-                        print(f"[MILES DEBUG] WARNING: Some logprobs missing after reorder, keeping processed order", flush=True)
+                        # print(f"[MILES DEBUG] WARNING: Some logprobs missing after reorder, keeping processed order", flush=True)
+                        pass
                 else:
-                    print(f"[MILES DEBUG] WARNING: processing_order len ({len(processing_order)}) != "
-                          f"logprobs len ({num_samples}), keeping processed order", flush=True)
+                    # print(f"[MILES DEBUG] WARNING: processing_order len ({len(processing_order)}) != "
+                    #       f"logprobs len ({num_samples}), keeping processed order", flush=True)
+                    pass
 
             if all_log_probs:
                 loss_dict["log_probs"] = all_log_probs
@@ -306,7 +309,7 @@ def run_forward_only(actor, data_iterator, num_microbatches):
                         reordered[original_idx] = log_probs_list[processed_pos]
                     if all(lp is not None for lp in reordered):
                         log_probs_list = reordered
-                        print(f"[MILES DEBUG] run_forward_only: Reordered {num_samples} logprobs to original order", flush=True)
+                        # print(f"[MILES DEBUG] run_forward_only: Reordered {num_samples} logprobs to original order", flush=True)
 
             loss_dict["log_probs"] = log_probs_list
         if "entropy" in rollout_data_result:

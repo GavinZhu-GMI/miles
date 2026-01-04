@@ -52,17 +52,17 @@ def get_batch(
     batch = data_iterator.get_next(keys)
 
     # Debug: ALWAYS log what keys are requested and what's in batch
-    print(f"[GET_BATCH DEBUG] requested keys: {keys}", flush=True)
+    # print(f"[GET_BATCH DEBUG] requested keys: {keys}", flush=True)
     lp = batch.get("log_probs")
     rlp = batch.get("rollout_log_probs")
-    print(f"[GET_BATCH DEBUG] log_probs: {'None' if lp is None else 'empty' if not lp else f'{len(lp)} samples'}", flush=True)
-    print(f"[GET_BATCH DEBUG] rollout_log_probs: {'None' if rlp is None else 'empty' if not rlp else f'{len(rlp)} samples'}", flush=True)
+    # print(f"[GET_BATCH DEBUG] log_probs: {'None' if lp is None else 'empty' if not lp else f'{len(lp)} samples'}", flush=True)
+    # print(f"[GET_BATCH DEBUG] rollout_log_probs: {'None' if rlp is None else 'empty' if not rlp else f'{len(rlp)} samples'}", flush=True)
     if lp:
         lp_sizes = [t.shape[0] if t is not None else 0 for t in lp]
-        print(f"[GET_BATCH DEBUG] log_probs sizes: {lp_sizes}, total={sum(lp_sizes)}", flush=True)
+        # print(f"[GET_BATCH DEBUG] log_probs sizes: {lp_sizes}, total={sum(lp_sizes)}", flush=True)
     if rlp:
         rlp_sizes = [t.shape[0] if t is not None else 0 for t in rlp]
-        print(f"[GET_BATCH DEBUG] rollout_log_probs sizes: {rlp_sizes}, total={sum(rlp_sizes)}", flush=True)
+        # print(f"[GET_BATCH DEBUG] rollout_log_probs sizes: {rlp_sizes}, total={sum(rlp_sizes)}", flush=True)
 
     packed_seq_params = None
     tokens = batch["tokens"]
@@ -287,14 +287,15 @@ def get_data_iterator(
     # Debug: Check initial rollout_data sizes
     if "log_probs" in rollout_data and rollout_data["log_probs"]:
         lp_sizes = [lp.shape[0] if lp is not None else 0 for lp in rollout_data["log_probs"]]
-        print(f"[DATA_ITER DEBUG] INITIAL rollout_data['log_probs']: {len(rollout_data['log_probs'])} samples, sizes={lp_sizes[:10]}..., total={sum(lp_sizes)}", flush=True)
+        # print(f"[DATA_ITER DEBUG] INITIAL rollout_data['log_probs']: {len(rollout_data['log_probs'])} samples, sizes={lp_sizes[:10]}..., total={sum(lp_sizes)}", flush=True)
     if "rollout_log_probs" in rollout_data and rollout_data["rollout_log_probs"]:
         rlp_sizes = [lp.shape[0] if lp is not None else 0 for lp in rollout_data["rollout_log_probs"]]
-        print(f"[DATA_ITER DEBUG] INITIAL rollout_data['rollout_log_probs']: {len(rollout_data['rollout_log_probs'])} samples, sizes={rlp_sizes[:10]}..., total={sum(rlp_sizes)}", flush=True)
+        # print(f"[DATA_ITER DEBUG] INITIAL rollout_data['rollout_log_probs']: {len(rollout_data['rollout_log_probs'])} samples, sizes={rlp_sizes[:10]}..., total={sum(rlp_sizes)}", flush=True)
     if "response_lengths" in rollout_data and rollout_data["response_lengths"]:
-        print(f"[DATA_ITER DEBUG] INITIAL response_lengths: {rollout_data['response_lengths'][:10]}..., total={sum(rollout_data['response_lengths'])}", flush=True)
+        # print(f"[DATA_ITER DEBUG] INITIAL response_lengths: {rollout_data['response_lengths'][:10]}..., total={sum(rollout_data['response_lengths'])}", flush=True)
+        pass
 
-    print(f"[MILES DEBUG] get_data_iterator: num_local_samples={num_local_samples}, dp_size={dp_size}, global_batch_size={args.global_batch_size}", flush=True)
+    # print(f"[MILES DEBUG] get_data_iterator: num_local_samples={num_local_samples}, dp_size={dp_size}, global_batch_size={args.global_batch_size}", flush=True)
 
     # FLEXIBLE BATCH SIZE: support variable batch sizes (e.g., when driven by external APIs like Tinker)
     target_local_batch_size = args.global_batch_size // dp_size
@@ -305,7 +306,7 @@ def get_data_iterator(
         num_local_gbs = target_local_batch_size
         num_steps_per_rollout = (num_local_samples + num_local_gbs - 1) // num_local_gbs
 
-    print(f"[MILES DEBUG] target_local_batch_size={target_local_batch_size}, num_local_gbs={num_local_gbs}, num_steps_per_rollout={num_steps_per_rollout}", flush=True)
+    # print(f"[MILES DEBUG] target_local_batch_size={target_local_batch_size}, num_local_gbs={num_local_gbs}, num_steps_per_rollout={num_steps_per_rollout}", flush=True)
 
     # Track the effective batch size (used later for loss scaling)
     if "_actual_global_batch_size" not in rollout_data:
@@ -363,7 +364,7 @@ def get_data_iterator(
 
         data_iterator = _generate_data_iterator(rollout_data, None, micro_batch_indices)
 
-    print(f"[MILES DEBUG] FINAL num_microbatches={num_microbatches}, use_dynamic_batch_size={args.use_dynamic_batch_size}", flush=True)
+    # print(f"[MILES DEBUG] FINAL num_microbatches={num_microbatches}, use_dynamic_batch_size={args.use_dynamic_batch_size}", flush=True)
 
     return (
         data_iterator,

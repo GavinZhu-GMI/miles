@@ -450,30 +450,34 @@ def policy_loss_function(
         are enabled.
     """
     # Debug: ALWAYS log what's in batch for log_probs and rollout_log_probs
-    print(f"[POLICY DEBUG] batch keys: {list(batch.keys())}", flush=True)
+    # print(f"[POLICY DEBUG] batch keys: {list(batch.keys())}", flush=True)
     lp = batch.get("log_probs")
     rlp = batch.get("rollout_log_probs")
-    print(f"[POLICY DEBUG] log_probs is {'None' if lp is None else 'empty' if not lp else f'{len(lp)} samples'}", flush=True)
-    print(f"[POLICY DEBUG] rollout_log_probs is {'None' if rlp is None else 'empty' if not rlp else f'{len(rlp)} samples'}", flush=True)
+    # print(f"[POLICY DEBUG] log_probs is {'None' if lp is None else 'empty' if not lp else f'{len(lp)} samples'}", flush=True)
+    # print(f"[POLICY DEBUG] rollout_log_probs is {'None' if rlp is None else 'empty' if not rlp else f'{len(rlp)} samples'}", flush=True)
     if lp:
         lp_sizes = [t.shape[0] if t is not None else 0 for t in lp]
-        print(f"[POLICY DEBUG] log_probs sizes: {lp_sizes}, total={sum(lp_sizes)}", flush=True)
+        # print(f"[POLICY DEBUG] log_probs sizes: {lp_sizes}, total={sum(lp_sizes)}", flush=True)
     if rlp:
         rlp_sizes = [t.shape[0] if t is not None else 0 for t in rlp]
-        print(f"[POLICY DEBUG] rollout_log_probs sizes: {rlp_sizes}, total={sum(rlp_sizes)}", flush=True)
+        # print(f"[POLICY DEBUG] rollout_log_probs sizes: {rlp_sizes}, total={sum(rlp_sizes)}", flush=True)
 
     advantages = torch.cat(batch["advantages"], dim=0)
 
     # DEBUG: Log advantage values for alignment verification
     import os
     if os.environ.get("DEBUG_ADVANTAGES"):
-        print(f"[ADVANTAGE DEBUG] advantages shape: {advantages.shape}", flush=True)
-        print(f"[ADVANTAGE DEBUG] advantages[:10]: {advantages[:10].tolist()}", flush=True)
-        print(f"[ADVANTAGE DEBUG] advantages mean: {advantages.mean().item():.6f}", flush=True)
-        print(f"[ADVANTAGE DEBUG] advantages std: {advantages.std().item():.6f}", flush=True)
-        # Also log per-sample advantage values (first value per sample)
-        per_sample_advs = [batch["advantages"][i][0].item() for i in range(min(8, len(batch["advantages"])))]
-        print(f"[ADVANTAGE DEBUG] per-sample advantages[:8]: {per_sample_advs}", flush=True)
+        # print(f"[ADVANTAGE DEBUG] advantages shape: {advantages.shape}", flush=True)
+        if advantages.shape[0] > 0:
+            # print(f"[ADVANTAGE DEBUG] advantages[:10]: {advantages[:10].tolist()}", flush=True)
+            # print(f"[ADVANTAGE DEBUG] advantages mean: {advantages.mean().item():.6f}", flush=True)
+            # print(f"[ADVANTAGE DEBUG] advantages std: {advantages.std().item():.6f}", flush=True)
+            # Also log per-sample advantage values (first value per sample)
+            per_sample_advs = [batch["advantages"][i][0].item() for i in range(min(8, len(batch["advantages"]))) if batch["advantages"][i].shape[0] > 0]
+            # print(f"[ADVANTAGE DEBUG] per-sample advantages[:8]: {per_sample_advs}", flush=True)
+        else:
+            # print(f"[ADVANTAGE DEBUG] advantages is EMPTY (CP rank has no tokens)", flush=True)
+            pass
 
     old_log_probs = batch["rollout_log_probs"] if args.use_rollout_logprobs else batch["log_probs"]
 
@@ -486,19 +490,20 @@ def policy_loss_function(
 
     # DEBUG: Print CP fix detection
     cp_size_debug = mpu.get_context_parallel_world_size()
-    print(f"[CP FIX DEBUG] cp_size={cp_size_debug}, with_tinker={with_tinker}", flush=True)
+    # print(f"[CP FIX DEBUG] cp_size={cp_size_debug}, with_tinker={with_tinker}", flush=True)
 
     # DEBUG: Print batch info for shape diagnosis
     adv_sizes = [a.shape[0] for a in batch["advantages"]]
-    print(f"[LOSS DEBUG] batch['advantages'] sizes: {adv_sizes}, total={sum(adv_sizes)}", flush=True)
-    print(f"[LOSS DEBUG] advantages (concat): shape={advantages.shape}", flush=True)
-    print(f"[LOSS DEBUG] response_lengths: {response_lengths}, sum={sum(response_lengths)}", flush=True)
-    print(f"[LOSS DEBUG] total_lengths: {total_lengths}, sum={sum(total_lengths)}", flush=True)
+    # print(f"[LOSS DEBUG] batch['advantages'] sizes: {adv_sizes}, total={sum(adv_sizes)}", flush=True)
+    # print(f"[LOSS DEBUG] advantages (concat): shape={advantages.shape}", flush=True)
+    # print(f"[LOSS DEBUG] response_lengths: {response_lengths}, sum={sum(response_lengths)}", flush=True)
+    # print(f"[LOSS DEBUG] total_lengths: {total_lengths}, sum={sum(total_lengths)}", flush=True)
     if hasattr(old_log_probs, '__len__') and not isinstance(old_log_probs, torch.Tensor):
         olp_sizes = [lp.shape[0] if lp is not None else 0 for lp in old_log_probs]
-        print(f"[LOSS DEBUG] old_log_probs (list) sizes: {olp_sizes}, total={sum(olp_sizes)}", flush=True)
+        # print(f"[LOSS DEBUG] old_log_probs (list) sizes: {olp_sizes}, total={sum(olp_sizes)}", flush=True)
     elif isinstance(old_log_probs, torch.Tensor):
-        print(f"[LOSS DEBUG] old_log_probs (tensor) shape: {old_log_probs.shape}", flush=True)
+        # print(f"[LOSS DEBUG] old_log_probs (tensor) shape: {old_log_probs.shape}", flush=True)
+        pass
 
     log_probs_and_entropy = get_log_probs_and_entropy(
         logits,
@@ -514,7 +519,7 @@ def policy_loss_function(
 
     # DEBUG: Print computed log_probs sizes
     computed_lp_sizes = [lp.shape[0] for lp in log_probs]
-    print(f"[LOSS DEBUG] log_probs (from get_log_probs_and_entropy) sizes: {computed_lp_sizes}, total={sum(computed_lp_sizes)}", flush=True)
+    # print(f"[LOSS DEBUG] log_probs (from get_log_probs_and_entropy) sizes: {computed_lp_sizes}, total={sum(computed_lp_sizes)}", flush=True)
 
     # Pre-gather log probs if needed by OPSM or GSPO to avoid duplicate gathering
     need_full_log_probs = args.use_opsm or args.advantage_estimator == "gspo"
@@ -588,10 +593,10 @@ def policy_loss_function(
             gathered_lp_sizes = [lp.shape[0] for lp in log_probs]
             gathered_olp_sizes = [olp.shape[0] for olp in old_log_probs]
             gathered_ent_sizes = [e.shape[0] for e in log_probs_and_entropy["entropy"]]
-            print(f"[CP FIX DEBUG] AFTER GATHERING: log_probs sizes: {gathered_lp_sizes}, total={sum(gathered_lp_sizes)}", flush=True)
-            print(f"[CP FIX DEBUG] AFTER GATHERING: old_log_probs sizes: {gathered_olp_sizes}, total={sum(gathered_olp_sizes)}", flush=True)
-            print(f"[CP FIX DEBUG] AFTER GATHERING: entropy sizes: {gathered_ent_sizes}, total={sum(gathered_ent_sizes)}", flush=True)
-            print(f"[CP FIX DEBUG] Using sum_of_sample_mean_full (rebuilt for full response_lengths)", flush=True)
+            # print(f"[CP FIX DEBUG] AFTER GATHERING: log_probs sizes: {gathered_lp_sizes}, total={sum(gathered_lp_sizes)}", flush=True)
+            # print(f"[CP FIX DEBUG] AFTER GATHERING: old_log_probs sizes: {gathered_olp_sizes}, total={sum(gathered_olp_sizes)}", flush=True)
+            # print(f"[CP FIX DEBUG] AFTER GATHERING: entropy sizes: {gathered_ent_sizes}, total={sum(gathered_ent_sizes)}", flush=True)
+            # print(f"[CP FIX DEBUG] Using sum_of_sample_mean_full (rebuilt for full response_lengths)", flush=True)
 
             # After gathering, tensors are full-size - recreate sum_of_sample_mean for full response_lengths
             # The passed-in sum_of_sample_mean uses CP-local chunk lengths, which won't work for gathered tensors
@@ -673,9 +678,10 @@ def policy_loss_function(
         ppo_kl = old_log_probs - log_probs
 
     # DEBUG: Print shapes right before compute_policy_loss (where the error occurs)
-    print(f"[LOSS DEBUG] BEFORE compute_policy_loss: ppo_kl.shape={ppo_kl.shape}, advantages.shape={advantages.shape}", flush=True)
+    # print(f"[LOSS DEBUG] BEFORE compute_policy_loss: ppo_kl.shape={ppo_kl.shape}, advantages.shape={advantages.shape}", flush=True)
     if ppo_kl.shape[0] != advantages.shape[0]:
-        print(f"[LOSS DEBUG] *** SHAPE MISMATCH DETECTED! ppo_kl has {ppo_kl.shape[0]} elements, advantages has {advantages.shape[0]} elements ***", flush=True)
+        # print(f"[LOSS DEBUG] *** SHAPE MISMATCH DETECTED! ppo_kl has {ppo_kl.shape[0]} elements, advantages has {advantages.shape[0]} elements ***", flush=True)
+        pass
 
     pg_loss, pg_clipfrac = compute_policy_loss(ppo_kl, advantages, args.eps_clip, args.eps_clip_high)
 
@@ -702,7 +708,7 @@ def policy_loss_function(
         ]
         # DEBUG: Print rollout_log_probs sizes after CP gathering
         gathered_rlp_sizes = [rlp.shape[0] for rlp in rollout_log_probs_list]
-        print(f"[CP FIX DEBUG] AFTER GATHERING: rollout_log_probs sizes: {gathered_rlp_sizes}, total={sum(gathered_rlp_sizes)}", flush=True)
+        # print(f"[CP FIX DEBUG] AFTER GATHERING: rollout_log_probs sizes: {gathered_rlp_sizes}, total={sum(gathered_rlp_sizes)}", flush=True)
 
     if args.get_mismatch_metrics or args.use_tis:
         if rollout_log_probs_list is None:
