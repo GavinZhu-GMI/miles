@@ -214,6 +214,9 @@ def run_forward_backward_only(actor, rollout_id, data_iterator, num_microbatches
     if mpu.is_pipeline_last_stage(ignore_virtual=True) and mpu.get_tensor_model_parallel_rank() == 0:
         # Aggregate losses from all steps
         keys = all_losses_reduced[0]["keys"]
+        # Check if data was gathered (Tinker path) - if so, don't multiply by cp_size
+        # because all CP ranks already have the same full values after gathering
+        with_tinker = all_losses_reduced[0].get("_with_tinker", False)
         # print(f"[MILES DEBUG] loss_dict keys from loss_function: {keys}", flush=True)
         values = None
         for item in all_losses_reduced:
@@ -226,8 +229,16 @@ def run_forward_backward_only(actor, rollout_id, data_iterator, num_microbatches
 
         values = values.tolist()
         num_samples_or_tokens = values[0]
+        cp_size = mpu.get_context_parallel_world_size()
         for key, value in zip(keys, values[1:]):
-            loss_dict[key] = value * mpu.get_context_parallel_world_size() / num_samples_or_tokens
+            if with_tinker and cp_size > 1:
+                # Tinker path with CP: data was gathered, all ranks have same full values
+                # After all_reduce, values are summed (cp_size * original_value)
+                # Don't multiply by cp_size, just divide by the summed count
+                loss_dict[key] = value / num_samples_or_tokens
+            else:
+                # Native path: each rank has partial data, need to scale by cp_size
+                loss_dict[key] = value * cp_size / num_samples_or_tokens
 
         # Aggregate logprobs from ALL steps (not just first)
         if "log_probs" in all_losses_reduced[0]:
@@ -294,7 +305,7 @@ def run_forward_only(actor, data_iterator, num_microbatches):
     loss_dict: Dict[str, list[torch.Tensor]] = {}
     # Only TP rank 0 at pipeline-last stage returns log_probs to avoid duplicates
     # across TP ranks (all TP ranks have identical values due to all-reduce).
-    # This is important for external APIs (opentinker-miles) that aggregate results.
+    # This is important for external APIs (tinkercloud) that aggregate results.
     if mpu.is_pipeline_last_stage() and mpu.get_tensor_model_parallel_rank() == 0:
         if "log_probs" in rollout_data_result:
             # Move to CPU to avoid device mismatch when aggregated across actors
