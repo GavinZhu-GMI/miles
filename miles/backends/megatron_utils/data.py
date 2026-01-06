@@ -309,8 +309,10 @@ def get_data_iterator(
     # print(f"[MILES DEBUG] target_local_batch_size={target_local_batch_size}, num_local_gbs={num_local_gbs}, num_steps_per_rollout={num_steps_per_rollout}", flush=True)
 
     # Track the effective batch size (used later for loss scaling)
+    # Include CP because loss.py:1071 multiplies by get_data_parallel_world_size(with_context_parallel=True)
+    # which returns DP × CP, so the divisor must also include CP to balance the formula
     if "_actual_global_batch_size" not in rollout_data:
-        rollout_data["_actual_global_batch_size"] = num_local_samples * dp_size
+        rollout_data["_actual_global_batch_size"] = num_local_samples * dp_size * cp_size
 
     def _generate_data_iterator(rollout_data, micro_batch_size, micro_batch_indices=None):
         data_iterator = []
