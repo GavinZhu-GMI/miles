@@ -228,7 +228,7 @@ def process_rollout_data(args, rollout_data_ref, dp_rank, dp_size):
         # Fix total_lengths to be partition-specific (for seqlen calculation)
         rollout_data["total_lengths"] = [total_lengths[i] for i in partition]
 
-        # Add _dp_original_indices for opentinker-miles logprobs reordering
+        # Add _dp_original_indices for tinkercloud logprobs reordering
         rollout_data["_dp_original_indices"] = list(partition)
 
         return rollout_data

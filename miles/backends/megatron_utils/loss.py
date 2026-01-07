@@ -696,7 +696,7 @@ def policy_loss_function(
         if filtered:
             rollout_log_probs_list = filtered
 
-    # When CP > 1 AND advantages are full-size (opentinker-miles), gather rollout_log_probs
+    # When CP > 1 AND advantages are full-size (tinkercloud), gather rollout_log_probs
     # to match full sequence length. For native RLVE (advantages CP-local), keep as CP-local.
     cp_size = mpu.get_context_parallel_world_size()
     if rollout_log_probs_list and cp_size > 1 and with_tinker:
@@ -780,7 +780,7 @@ def policy_loss_function(
             pg_loss, modified_response_masks, tis_metrics = tis_func(**tis_kwargs)
 
             # [decouple IS and rejection] Rebuild sum_of_sample_mean with modified_response_masks for denominator correction
-            # When advantages are full-size (opentinker-miles), use full response_lengths
+            # When advantages are full-size (tinkercloud), use full response_lengths
             # Otherwise, get_sum_of_sample_mean will use CP-local chunk lengths
             if with_tinker:
                 def sum_of_sample_mean_tis(x: torch.Tensor) -> torch.Tensor:
@@ -1082,6 +1082,9 @@ def loss_function(
             + list(log.values()),
             device=logits.device,
         ),
+        # Propagate _with_tinker flag to ray_step.py for correct metric scaling
+        # When True, data was gathered across CP ranks, so metrics shouldn't be multiplied by cp_size
+        "_with_tinker": batch.get("_with_tinker", False),
     }
     if log_probs is not None:
         result_dict["log_probs"] = log_probs
