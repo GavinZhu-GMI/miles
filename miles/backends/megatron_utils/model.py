@@ -110,6 +110,20 @@ def setup_model_and_optimizer(
 
     model = get_model(get_model_provider_func(args, role), ModelType.encoder_or_decoder)
 
+    # Freeze base model parameters for LoRA training
+    # This must happen BEFORE optimizer creation so optimizer only tracks LoRA params
+    if getattr(args, "lora_rank", 0) > 0:
+        from .lora import freeze_base_model_parameters
+        for m in model:
+            freeze_base_model_parameters(m)
+
+        # LoRA params should not have weight decay (they are low-rank, not prone to overfitting)
+        if no_wd_decay_cond is None:
+            no_wd_decay_cond = lambda name, param: "lora_" in name
+        else:
+            original_cond = no_wd_decay_cond
+            no_wd_decay_cond = lambda name, param: "lora_" in name or original_cond(name, param)
+
     # Optimizer
     kwargs = {}
     for f in dataclasses.fields(OptimizerConfig):

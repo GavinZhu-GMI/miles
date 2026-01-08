@@ -24,7 +24,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
     ), f"{args.load=} does not exist or is an empty directory. Did you specify the wrong folder?"
 
     if _is_megatron_checkpoint(load_path):
-        return _load_checkpoint_megatron(
+        result = _load_checkpoint_megatron(
             ddp_model=ddp_model,
             optimizer=optimizer,
             opt_param_scheduler=opt_param_scheduler,
@@ -32,12 +32,18 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
             skip_load_to_model_and_opt=skip_load_to_model_and_opt,
         )
     else:
-        return _load_checkpoint_hf(
+        result = _load_checkpoint_hf(
             ddp_model=ddp_model,
             optimizer=optimizer,
             args=args,
             load_path=load_path,
         )
+
+    # Load LoRA checkpoint if configured
+    if getattr(args, "lora_rank", 0) > 0 and getattr(args, "lora_checkpoint", None):
+        _load_lora_checkpoint(ddp_model, args)
+
+    return result
 
 
 def _is_megatron_checkpoint(path: str | Path) -> bool:
@@ -71,3 +77,21 @@ def _load_checkpoint_hf(ddp_model, optimizer, args, load_path: str):
 def _is_dir_nonempty(path):
     with os.scandir(path) as it:
         return any(it)
+
+
+def _load_lora_checkpoint(ddp_model, args):
+    """Load LoRA checkpoint into the model.
+
+    Args:
+        ddp_model: List of DDP-wrapped model chunks
+        args: Training arguments with lora_checkpoint path
+    """
+    from .lora import load_lora_checkpoint
+
+    lora_path = args.lora_checkpoint
+    logger.info(f"Loading LoRA checkpoint from {lora_path}")
+
+    for model_chunk in ddp_model:
+        # Access the underlying module (unwrap DDP)
+        model = model_chunk.module if hasattr(model_chunk, "module") else model_chunk
+        load_lora_checkpoint(model, lora_path, args=args, strict=False)

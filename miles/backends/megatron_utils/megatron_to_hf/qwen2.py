@@ -3,6 +3,15 @@ import torch
 
 
 def convert_qwen2_to_hf(args, name, param):
+    # Handle LoRA adapter naming: base_layer.weight -> weight
+    # LoRA wraps linear layers, so parameter names become layer.base_layer.weight instead of layer.weight
+    name = name.replace('.base_layer.weight', '.weight')
+    name = name.replace('.base_layer.bias', '.bias')
+
+    # Skip LoRA-specific parameters (lora_A, lora_B) - SGLang doesn't have these
+    # Match both middle (.lora_A.) and end (.lora_A) positions
+    if '.lora_A' in name or '.lora_B' in name or '.lora_embedding_' in name:
+        return []
     if name == "module.module.embedding.word_embeddings.weight":
         return [("model.embed_tokens.weight", param)]
     if name == "module.module.output_layer.weight":

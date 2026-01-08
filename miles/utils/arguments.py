@@ -1221,6 +1221,34 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
             )
             return parser
 
+        def add_lora_arguments(parser):
+            """Add LoRA (Low-Rank Adaptation) arguments for parameter-efficient fine-tuning."""
+            parser.add_argument(
+                "--lora-rank",
+                type=int,
+                default=0,
+                help="LoRA rank. 0 disables LoRA. Typical values: 8, 16, 32, 64.",
+            )
+            parser.add_argument(
+                "--lora-alpha",
+                type=float,
+                default=None,
+                help="LoRA alpha scaling factor. Defaults to lora_rank if not set (scaling = 1.0).",
+            )
+            parser.add_argument(
+                "--lora-dropout",
+                type=float,
+                default=0.0,
+                help="LoRA dropout rate. Default 0.0 (no dropout).",
+            )
+            parser.add_argument(
+                "--lora-checkpoint",
+                type=str,
+                default=None,
+                help="Path to LoRA checkpoint to load. If not set, LoRA adapters start from scratch.",
+            )
+            return parser
+
         def add_rlve_arguments(parser):
             """Add RLVE (Reinforcement Learning with Verifiable Environments) arguments."""
             parser.add_argument(
@@ -1310,6 +1338,7 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
         parser = add_prefill_decode_disaggregation_arguments(parser)
         parser = add_ci_arguments(parser)
         parser = add_rlve_arguments(parser)
+        parser = add_lora_arguments(parser)
         parser.set_defaults(sglang_tensor_parallel_size=add_sglang_tp_size())
 
         # For megatron
@@ -1437,6 +1466,18 @@ def _resolve_eval_datasets(args) -> list[EvalDatasetConfig]:
 
 def miles_validate_args(args):
     args.eval_datasets = _resolve_eval_datasets(args)
+
+    # LoRA validation and defaults
+    if getattr(args, "lora_rank", 0) > 0:
+        if args.lora_alpha is None:
+            args.lora_alpha = args.lora_rank  # Default: scaling = 1.0
+            logger.info(f"LoRA enabled: rank={args.lora_rank}, alpha={args.lora_alpha} (default)")
+        else:
+            logger.info(f"LoRA enabled: rank={args.lora_rank}, alpha={args.lora_alpha}")
+
+        if args.lora_checkpoint is not None:
+            if not os.path.exists(args.lora_checkpoint):
+                raise FileNotFoundError(f"LoRA checkpoint {args.lora_checkpoint} does not exist")
 
     if args.kl_coef != 0 or args.use_kl_loss:
         if not os.path.exists(args.ref_load):

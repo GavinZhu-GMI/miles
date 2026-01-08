@@ -155,6 +155,11 @@ def get_model_provider_func(
         with build_model_context(**build_model_context_args):
             model = GPTModel(**kwargs)
 
+        # Inject LoRA adapters if configured
+        if getattr(args, "lora_rank", 0) > 0:
+            from .lora import inject_lora_adapters
+            model = inject_lora_adapters(model, args)
+
         if post_process and role == "critic":
             model.output_layer = LinearForLastLayer(input_size=config.hidden_size, output_size=1, config=config)
 

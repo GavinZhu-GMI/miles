@@ -380,6 +380,46 @@ class SGLangEngine(RayActor):
         response.raise_for_status()
         return response
 
+    def load_lora_adapter(self, adapter_path: str, adapter_name: str):
+        """Load a LoRA adapter from the given path.
+
+        Args:
+            adapter_path: Path to the adapter directory (must contain adapter_config.json and adapter_model.bin)
+            adapter_name: Name to assign to the adapter for later reference
+
+        Returns:
+            JSON response from the server
+        """
+        if self.node_rank != 0:
+            return
+
+        return self._make_request(
+            "load_lora_adapter",
+            {
+                "lora_path": adapter_path,
+                "lora_name": adapter_name,
+            },
+        )
+
+    def unload_lora_adapter(self, adapter_name: str):
+        """Unload a LoRA adapter by name.
+
+        Args:
+            adapter_name: Name of the adapter to unload
+
+        Returns:
+            JSON response from the server
+        """
+        if self.node_rank != 0:
+            return
+
+        return self._make_request(
+            "unload_lora_adapter",
+            {
+                "lora_name": adapter_name,
+            },
+        )
+
 
 def _compute_server_args(args, rank, dist_init_addr, nccl_port, host, port, worker_type: str = "regular"):
     nnodes = max(1, args.rollout_num_gpus_per_engine // args.num_gpus_per_node)
@@ -407,6 +447,13 @@ def _compute_server_args(args, rank, dist_init_addr, nccl_port, host, port, work
         # always skip warmup to prevent warmup timeout.
         "skip_server_warmup": True,
     }
+
+    # Configure LoRA support for dynamic adapter loading
+    if getattr(args, "lora_rank", 0) > 0:
+        kwargs["max_lora_rank"] = args.lora_rank
+        logger.info(f"SGLang engine configured with max_lora_rank={args.lora_rank} for dynamic adapter loading")
+        # Note: Don't load initial adapter via lora_paths - adapters will be loaded
+        # dynamically via load_lora_adapter() after training updates weights
 
     if worker_type == "prefill":
         kwargs["disaggregation_mode"] = "prefill"

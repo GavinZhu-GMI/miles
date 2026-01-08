@@ -1063,6 +1063,7 @@ def loss_function(
 
     # Here we need to divide by cp_size because to cancel the multiply in Megatron.
     actual_global_batch_size = batch.get("_actual_global_batch_size", args.global_batch_size)
+    print(f"[DEBUG LOSS] actual_global_batch_size={actual_global_batch_size}, args.global_batch_size={args.global_batch_size}, num_microbatches={num_microbatches}", flush=True)
     if not args.calculate_per_token_loss:
         loss = (
             loss
