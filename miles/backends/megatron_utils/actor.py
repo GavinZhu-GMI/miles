@@ -555,19 +555,56 @@ class MegatronTrainRayActor(TrainRayActor):
             "loss": loss_dict,
             "grad_norm": 0.0,
             "valid_step": True,
+            # Return DP partition indices for correct result aggregation (same as forward_backward_only_step)
+            "_dp_original_indices": rollout_data.get("_dp_original_indices", []),
         }
 
-    def apply_optimizer_step(self) -> Dict[str, float]:
+    def apply_optimizer_step(self, learning_rate: float = None) -> Dict[str, float]:
         """
         Apply optimizer step after one or more gradient accumulation passes.
+
+        Args:
+            learning_rate: Optional learning rate to override optimizer's current LR.
+                          If provided, updates all param_groups['lr'] before stepping.
+                          This allows tinker-cookbook to use dynamic LR schedules.
         """
         args = get_args()
+
+        # Override learning rate if provided by client (tinker-cookbook dynamic LR support)
+        if learning_rate is not None:
+            for param_group in self.optimizer.param_groups:
+                # Preserve lr_mult if set (for different param group scaling)
+                lr_mult = param_group.get('lr_mult', 1.0)
+                param_group['lr'] = learning_rate * lr_mult
+
+        # DEBUG: Print gradient info before optimizer step
+        lora_grad_norms = []
+        lora_weights_before = {}
+        for name, param in self.model[0].named_parameters():
+            if 'lora_' in name and param.grad is not None:
+                lora_grad_norms.append((name.split('.')[-2] + '.' + name.split('.')[-1], param.grad.norm().item()))
+                lora_weights_before[name] = param.data.clone()
+        if lora_grad_norms:
+            # Show actual LR being used (either client-provided or from scheduler)
+            actual_lr = learning_rate if learning_rate is not None else self.opt_param_scheduler.get_lr()
+            print(f"[DEBUG] global_batch_size={args.global_batch_size}, lr={actual_lr}")
+            print(f"[DEBUG] LoRA grad norms (first 5): {lora_grad_norms[:5]}")
 
         with timer("apply_optimizer_step"):
             update_successful, grad_norm, _ = self.optimizer.step()
 
             if update_successful:
                 self.opt_param_scheduler.step(increment=args.global_batch_size)
+
+            # DEBUG: Print weight changes after optimizer step
+            if lora_weights_before:
+                weight_changes = []
+                for name, param in self.model[0].named_parameters():
+                    if name in lora_weights_before:
+                        change = (param.data - lora_weights_before[name]).norm().item()
+                        weight_changes.append((name.split('.')[-2] + '.' + name.split('.')[-1], change))
+                print(f"[DEBUG] LoRA weight changes (first 5): {weight_changes[:5]}")
+                print(f"[DEBUG] update_successful={update_successful}, grad_norm={grad_norm}")
 
             for model_chunk in self.model:
                 model_chunk.zero_grad_buffer()
@@ -617,6 +654,36 @@ class MegatronTrainRayActor(TrainRayActor):
                     self.weights_backuper.backup("rollout_actor")
                 else:
                     self.weights_backuper.backup("old_actor")
+
+        if self.args.offload_train:
+            destroy_process_groups()
+
+    def update_lora_weights(self) -> None:
+        """Update only LoRA weights to SGLang (separate from base weight update).
+
+        In LoRA training mode, base weights are frozen and only LoRA adapters are trained.
+        This method syncs the updated LoRA weights to SGLang engines for inference.
+        """
+        if self.args.debug_train_only or self.args.debug_rollout_only:
+            return
+
+        if not getattr(self.args, "lora_rank", 0) > 0:
+            return
+
+        if self.args.offload_train:
+            reload_process_groups()
+
+        rollout_engines, rollout_engine_lock, num_new_engines = ray.get(
+            self.rollout_manager.get_rollout_engines_and_lock.remote()
+        )
+        if num_new_engines > 0:
+            self.weight_updater.connect_rollout_engines(rollout_engines, rollout_engine_lock)
+            dist.barrier(group=get_gloo_group())
+
+        with torch_memory_saver.disable() if self.args.offload_train else nullcontext():
+            print_memory("before update_lora_weights")
+            self.weight_updater.update_lora_weights()
+            print_memory("after update_lora_weights")
 
         if self.args.offload_train:
             destroy_process_groups()

@@ -123,6 +123,10 @@ class RayTrainGroup:
         """Broadcast weights from rank 0 to all other ranks."""
         return ray.get([actor.update_weights.remote() for actor in self._actor_handlers])
 
+    def update_lora_weights(self):
+        """Update LoRA weights across all actors to SGLang engines."""
+        return ray.get([actor.update_lora_weights.remote() for actor in self._actor_handlers])
+
     def onload(self):
         return ray.get([actor.wake_up.remote() for actor in self._actor_handlers])
 
@@ -246,23 +250,35 @@ class RayTrainGroup:
         """
         Forward-only inference to fetch per-sample log probabilities (used by DPO reference runs).
         """
-        return ray.get(
+        raw_results = ray.get(
             [actor.forward_only_step.remote(rollout_id, rollout_data_ref) for actor in self._actor_handlers]
         )
+        # Aggregate DP results (reorder logprobs to original sample order)
+        return self._aggregate_dp_results(raw_results)
 
-    def apply_optimizer_step(self):
+    def apply_optimizer_step(self, learning_rate: float = None):
         """
         Apply optimizer step after manual gradient accumulation.
-        """
-        return ray.get([actor.apply_optimizer_step.remote() for actor in self._actor_handlers])
 
-    def apply_optimizer_step_and_sync(self):
+        Args:
+            learning_rate: Optional learning rate to override optimizer's current LR.
+                          If provided, updates all param_groups['lr'] before stepping.
+        """
+        return ray.get([
+            actor.apply_optimizer_step.remote(learning_rate=learning_rate)
+            for actor in self._actor_handlers
+        ])
+
+    def apply_optimizer_step_and_sync(self, learning_rate: float = None):
         """
         Apply optimizer step and sync weights to SGLang.
 
         Combines apply_optimizer_step() + update_weights() for Tinker API use case
         where we always want to sync weights after training before next sample().
+
+        Args:
+            learning_rate: Optional learning rate to override optimizer's current LR.
         """
-        results = self.apply_optimizer_step()
+        results = self.apply_optimizer_step(learning_rate=learning_rate)
         self.update_weights()
         return results
