@@ -156,7 +156,9 @@ def get_model_provider_func(
             model = GPTModel(**kwargs)
 
         # Inject LoRA adapters if configured
-        if getattr(args, "lora_rank", 0) > 0:
+        # NOTE: If _delay_lora_injection is set, skip injection here - it will be done
+        # after checkpoint loading in model.py to avoid weight name mismatch
+        if getattr(args, "lora_rank", 0) > 0 and not getattr(args, "_delay_lora_injection", False):
             from .lora import inject_lora_adapters
             model = inject_lora_adapters(model, args)
 

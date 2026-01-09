@@ -87,8 +87,9 @@ def setup_model_and_optimizer(
     no_wd_decay_cond: Callable[..., bool] | None = None,
     scale_lr_cond: Callable[..., bool] | None = None,
     lr_mult: float = 1.0,
-) -> tuple[list[DDP], MegatronOptimizer, OptimizerParamScheduler]:
-    """Build model(s), wrap with DDP, and construct optimizer and scheduler.
+    skip_optimizer: bool = False,
+) -> tuple[list[DDP], MegatronOptimizer | None, OptimizerParamScheduler | None]:
+    """Build model(s), wrap with DDP, and optionally construct optimizer and scheduler.
 
     Args:
         args (Namespace): Training/runtime arguments (argparse namespace).
@@ -98,12 +99,14 @@ def setup_model_and_optimizer(
         scale_lr_cond (Callable[..., bool] | None): Predicate to scale LR for
             selected parameter groups.
         lr_mult (float): Global learning-rate multiplier for the optimizer.
+        skip_optimizer (bool): If True, skip optimizer creation and return None.
+            Used for LoRA training where optimizer must be created after LoRA injection.
 
     Returns:
-        tuple[list[DDP], MegatronOptimizer, OptimizerParamScheduler]:
+        tuple[list[DDP], MegatronOptimizer | None, OptimizerParamScheduler | None]:
             - List of model chunks wrapped by ``DDP``.
-            - The constructed ``MegatronOptimizer`` instance.
-            - The learning-rate/weight-decay scheduler tied to the optimizer.
+            - The constructed ``MegatronOptimizer`` instance (or None if skip_optimizer).
+            - The learning-rate/weight-decay scheduler tied to the optimizer (or None).
     """
     assert not args.moe_use_upcycling
     assert args.load is not None or args.pretrained_checkpoint is not None
@@ -111,13 +114,19 @@ def setup_model_and_optimizer(
     model = get_model(get_model_provider_func(args, role), ModelType.encoder_or_decoder)
 
     # Freeze base model parameters for LoRA training
-    # This must happen BEFORE optimizer creation so optimizer only tracks LoRA params
-    if getattr(args, "lora_rank", 0) > 0:
+    # NOTE: If _delay_lora_injection is set, skip this - it will be done in
+    # initialize_model_and_optimizer after LoRA is injected post-checkpoint-load
+    if getattr(args, "lora_rank", 0) > 0 and not getattr(args, "_delay_lora_injection", False):
         from .lora import freeze_base_model_parameters
         for m in model:
             freeze_base_model_parameters(m)
 
-        # LoRA params should not have weight decay (they are low-rank, not prone to overfitting)
+    # Skip optimizer creation if requested (for LoRA delayed injection flow)
+    if skip_optimizer:
+        return model, None, None
+
+    # LoRA params should not have weight decay (they are low-rank, not prone to overfitting)
+    if getattr(args, "lora_rank", 0) > 0:
         if no_wd_decay_cond is None:
             no_wd_decay_cond = lambda name, param: "lora_" in name
         else:
@@ -715,10 +724,69 @@ def save(
         enable_forward_pre_hook(model)
 
 
+def _create_optimizer_for_lora(
+    model: list[DDP],
+    args: Namespace,
+) -> tuple[MegatronOptimizer, OptimizerParamScheduler]:
+    """Create optimizer after LoRA injection, tracking only LoRA params.
+
+    This is called after LoRA adapters are injected and base parameters are frozen.
+    The optimizer will only track parameters with requires_grad=True (LoRA params).
+
+    Args:
+        model (list[DDP]): DDP-wrapped model chunks with LoRA injected.
+        args (Namespace): Training/runtime arguments.
+
+    Returns:
+        tuple[MegatronOptimizer, OptimizerParamScheduler]:
+            Optimizer and scheduler for LoRA training.
+    """
+    # LoRA params should not have weight decay
+    no_wd_decay_cond = lambda name, param: "lora_" in name
+
+    # Build optimizer config from args
+    kwargs = {}
+    for f in dataclasses.fields(OptimizerConfig):
+        if hasattr(args, f.name):
+            kwargs[f.name] = getattr(args, f.name)
+    config = OptimizerConfig(**kwargs)
+    config.timers = None
+
+    optimizer = get_megatron_optimizer(
+        config,
+        model,
+        no_wd_decay_cond,
+        None,  # scale_lr_cond
+        1.0,   # lr_mult
+        use_gloo_process_groups=args.enable_gloo_process_groups,
+    )
+    opt_param_scheduler = get_optimizer_param_scheduler(args, optimizer)
+
+    # Log optimizer info for debugging
+    total_params = sum(len(pg['params']) for pg in optimizer.param_groups)
+    trainable_params = sum(
+        p.numel() for pg in optimizer.param_groups for p in pg['params'] if p.requires_grad
+    )
+    logger.info(f"LoRA optimizer created: {total_params} param tensors, {trainable_params:,} trainable elements")
+
+    return optimizer, opt_param_scheduler
+
+
 def initialize_model_and_optimizer(
     args: Namespace, role: str = "actor"
 ) -> tuple[list[DDP], MegatronOptimizer, OptimizerParamScheduler, int]:
     """Initialize model(s), optimizer, scheduler, and load from checkpoint.
+
+    The initialization sequence is carefully ordered to support LoRA training:
+    1. Create base model (without LoRA) so checkpoint names match
+    2. Load checkpoint (base weights load correctly)
+    3. Inject LoRA adapters (preserves loaded base weights)
+    4. Freeze base parameters
+    5. Create optimizer (now sees only LoRA params as trainable)
+
+    For non-LoRA training, the sequence is:
+    1. Create model with optimizer
+    2. Load checkpoint (full model + optimizer state)
 
     Args:
         args (Namespace): Runtime arguments.
@@ -736,16 +804,52 @@ def initialize_model_and_optimizer(
         filesystem_async_module.FileSystemWriterAsync = ROCmFileSystemWriterAsync
         print("[ROCm] Applied FileSystemWriterAsync patch for HIP compatibility")
 
-    model, optimizer, opt_param_scheduler = setup_model_and_optimizer(args, role)
-    model[0].role = role
-    clear_memory()
-    iteration, _ = load_checkpoint(
-        model,
-        optimizer,
-        opt_param_scheduler,
-        checkpointing_context={},
-        skip_load_to_model_and_opt=False,
-    )
-    clear_memory()
+    lora_rank = getattr(args, "lora_rank", 0)
+
+    if lora_rank > 0:
+        # LoRA training flow:
+        # 1. Create model WITHOUT LoRA (checkpoint names will match)
+        # 2. Skip optimizer creation (will create after LoRA injection)
+        args._delay_lora_injection = True
+        model, _, _ = setup_model_and_optimizer(args, role, skip_optimizer=True)
+        model[0].role = role
+        clear_memory()
+
+        # 3. Load checkpoint (base weights only, no optimizer state for fresh LoRA training)
+        iteration, _ = load_checkpoint(
+            model,
+            None,  # No optimizer - will create after LoRA injection
+            None,  # No scheduler
+            checkpointing_context={},
+            skip_load_to_model_and_opt=False,
+        )
+        clear_memory()
+
+        # 4. Inject LoRA adapters after base weights are loaded
+        # Use unwrap_model to get past DDP and Float16Module wrappers to the actual GPTModel
+        from megatron.core.utils import unwrap_model
+        from .lora import inject_lora_adapters, freeze_base_model_parameters
+        unwrapped_models = unwrap_model(model)
+        for underlying in unwrapped_models:
+            inject_lora_adapters(underlying, args)
+            freeze_base_model_parameters(underlying)
+        logger.info("LoRA adapters injected and base params frozen after checkpoint load")
+
+        # 5. NOW create optimizer (sees LoRA params as trainable)
+        optimizer, opt_param_scheduler = _create_optimizer_for_lora(model, args)
+
+    else:
+        # Standard (non-LoRA) training flow
+        model, optimizer, opt_param_scheduler = setup_model_and_optimizer(args, role)
+        model[0].role = role
+        clear_memory()
+        iteration, _ = load_checkpoint(
+            model,
+            optimizer,
+            opt_param_scheduler,
+            checkpointing_context={},
+            skip_load_to_model_and_opt=False,
+        )
+        clear_memory()
 
     return model, optimizer, opt_param_scheduler, iteration
