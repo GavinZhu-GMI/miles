@@ -243,13 +243,9 @@ def run_forward_backward_only(actor, rollout_id, data_iterator, num_microbatches
         # Aggregate logprobs from ALL steps (not just first)
         if "log_probs" in all_losses_reduced[0]:
             all_log_probs = []
-            # print(f"[MILES DEBUG] all_losses_reduced has {len(all_losses_reduced)} entries (across {num_steps} steps)", flush=True)
-            for idx, entry in enumerate(all_losses_reduced):
-                lp = entry.get("log_probs", [])
-                # print(f"[MILES DEBUG] Entry {idx}: log_probs count = {len(lp) if lp else 0}", flush=True)
+            for entry in all_losses_reduced:
                 if "log_probs" in entry and entry["log_probs"]:
                     all_log_probs.extend(entry["log_probs"])
-            # print(f"[MILES DEBUG] Total all_log_probs: {len(all_log_probs)}", flush=True)
 
             # REORDER logprobs from processed order back to original sample order
             # This is necessary because sequence-length balancing reorders samples
