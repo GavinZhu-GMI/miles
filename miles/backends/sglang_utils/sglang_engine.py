@@ -450,8 +450,12 @@ def _compute_server_args(args, rank, dist_init_addr, nccl_port, host, port, work
 
     # Configure LoRA support for dynamic adapter loading
     if getattr(args, "lora_rank", 0) > 0:
+        kwargs["enable_lora"] = True
         kwargs["max_lora_rank"] = args.lora_rank
-        logger.info(f"SGLang engine configured with max_lora_rank={args.lora_rank} for dynamic adapter loading")
+        # SGLang requires target_modules when no initial lora_paths is provided
+        # These map to Megatron's linear_qkv (fused Q/K/V) and linear_proj (O)
+        kwargs["lora_target_modules"] = ["q_proj", "k_proj", "v_proj", "o_proj"]
+        logger.info(f"SGLang engine configured with enable_lora=True, max_lora_rank={args.lora_rank} for dynamic adapter loading")
         # Note: Don't load initial adapter via lora_paths - adapters will be loaded
         # dynamically via load_lora_adapter() after training updates weights
 
