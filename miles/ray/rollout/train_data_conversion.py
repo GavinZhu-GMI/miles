@@ -160,6 +160,13 @@ def split_train_data_by_dp_raw(args, data: dict[str, Any], *, dp_size: int) -> l
             "opd_reverse_kl",
             "seq_witness_ids",
             "weight_versions",
+            # Tinker seam: loss inputs supplied per-sample by the client
+            # (normally computed actor-side by compute_advantages_and_returns).
+            "log_probs",
+            "ref_log_probs",
+            "advantages",
+            "returns",
+            "values",
         ]:
             if key not in data:
                 continue
@@ -170,6 +177,9 @@ def split_train_data_by_dp_raw(args, data: dict[str, Any], *, dp_size: int) -> l
             "raw_reward",
             "total_lengths",
             "dynamic_global_batch_size",
+            # Tinker seam: per-request scalar metadata for the loss layer.
+            "_loss_type_override",
+            "_loss_norm_total",
         ]:
             if key not in data:
                 continue
