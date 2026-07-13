@@ -24,7 +24,7 @@ def add_sglang_router_arguments(parser):
     parser.add_argument(
         "--sglang-router-request-timeout-secs",
         type=int,
-        default=3600,
+        default=14400,
         help="Timeout for requests to the SGLang router in seconds",
     )
     return parser
@@ -36,6 +36,15 @@ def add_sglang_arguments(parser):
     """
     parser = add_sglang_router_arguments(parser)
     parser.add_argument("--sglang-server-concurrency", type=int, default=512)
+
+    # LoRA adapter path for SGLang (used when LoRA is enabled)
+    parser.add_argument(
+        "--sglang-lora-adapter-path",
+        type=str,
+        default=None,
+        help="Path to LoRA adapter in PEFT format for SGLang to load. "
+             "Used when lora_rank > 0 for inference-time adapter loading.",
+    )
 
     old_add_argument = parser.add_argument
 

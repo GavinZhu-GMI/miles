@@ -2,6 +2,7 @@ import json
 import logging
 import random
 import re
+from typing import Dict, List, Union
 
 import numpy as np
 import pandas as pd
@@ -12,9 +13,55 @@ from miles.utils.types import Sample
 from .seqlen_balancing import get_seqlen_balanced_partitions
 from .timer import Timer
 
-__all__ = ["Dataset"]
+__all__ = ["Dataset", "custom_prompt_preprocessor"]
 
 logger = logging.getLogger(__name__)
+
+
+# RLVE TinyZero prompt template
+TINYZERO_TEMPLATE = """A conversation between User and Assistant. The user asks a question, and the assistant solves it. The assistant first thinks about the reasoning process in the mind and then provides the user with the answer. Show your work in <think> </think> tags, and return the final answer in <answer> </answer> tags.
+User: {prompt}
+Assistant: Let me solve this step by step.
+<think>"""
+
+
+def custom_prompt_preprocessor(
+    args, user_prompt: str, apply_chat_template: bool
+) -> Union[str, List[Dict[str, str]]]:
+    """
+    Preprocess user prompts for RLVE training.
+
+    Args:
+        args: Training arguments with custom_prompt_preprocessor setting
+        user_prompt: The raw user prompt string
+        apply_chat_template: Whether chat template will be applied
+
+    Returns:
+        Processed prompt (string for TinyZero, list of dicts for ChatTemplate)
+    """
+    preprocessor = getattr(args, 'custom_prompt_preprocessor', None)
+
+    if preprocessor is None:
+        # No preprocessing - return as-is or wrap in chat format if needed
+        if apply_chat_template:
+            if isinstance(user_prompt, list) and len(user_prompt) > 0 and isinstance(user_prompt[0], dict):
+                return user_prompt
+            return [{"role": "user", "content": user_prompt}]
+        return user_prompt
+
+    if preprocessor == "TinyZero":
+        assert not apply_chat_template, "TinyZero preprocessor should not use chat template"
+        return TINYZERO_TEMPLATE.format(prompt=user_prompt)
+
+    elif preprocessor == "ChatTemplate_NoSystemPrompt":
+        assert apply_chat_template, "ChatTemplate_NoSystemPrompt requires apply_chat_template=True"
+        # Check if user_prompt is already in chat format (list of dicts)
+        if isinstance(user_prompt, list) and len(user_prompt) > 0 and isinstance(user_prompt[0], dict) and "role" in user_prompt[0]:
+            return user_prompt
+        return [{"role": "user", "content": user_prompt}]
+
+    else:
+        raise NotImplementedError(f"User prompt processor {preprocessor} not implemented.")
 
 
 # TODO: don't read the whole file into memory.
@@ -53,6 +100,7 @@ class Dataset:
         tokenizer,
         max_length,
         *,
+        processor=None,
         prompt_key="text",
         multimodal_keys=None,
         label_key=None,
@@ -62,6 +110,7 @@ class Dataset:
         apply_chat_template=False,
         apply_chat_template_kwargs=None,
     ):
+        self.processor = processor
         self.origin_samples = []
         for data in read_file(path):
             if multimodal_keys:
@@ -152,13 +201,39 @@ def process_rollout_data(args, rollout_data_ref, dp_rank, dp_size):
 
     rank = dist.get_rank()
     if rank == 0:
-        data = ray.get(rollout_data_ref.inner)
+        # Handle both list (upstream) and single Box (legacy) formats
+        if isinstance(rollout_data_ref, list):
+            # Upstream format: list of pre-partitioned Box objects
+            assert len(rollout_data_ref) == dp_size, f"Expected {dp_size} partitions, got {len(rollout_data_ref)}"
+            data = ray.get(rollout_data_ref[dp_rank].inner)
+        else:
+            # Legacy format: single Box with all data
+            data = ray.get(rollout_data_ref.inner)
         dist.broadcast_object_list([data], src=0)
     else:
         data = [None]
         dist.broadcast_object_list(data, src=0)
         data = data[0]
 
+    # Check if data was pre-partitioned by upstream's _split_train_data_by_dp()
+    # If so, data already contains only this rank's samples
+    if "partition" in data:
+        partition = data.pop("partition")
+        total_lengths = data["total_lengths"]
+        Timer().seq_lens = total_lengths
+
+        # Data is already partitioned - copy as-is
+        rollout_data = data
+
+        # Fix total_lengths to be partition-specific (for seqlen calculation)
+        rollout_data["total_lengths"] = [total_lengths[i] for i in partition]
+
+        # Add _dp_original_indices for tinkercloud logprobs reordering
+        rollout_data["_dp_original_indices"] = list(partition)
+
+        return rollout_data
+
+    # Legacy path: data is not pre-partitioned, do partitioning here
     # save the unprocessed reward for logging (optional for forward-only passes)
     if "raw_reward" in data:
         rollout_data["raw_reward"] = data["raw_reward"]
@@ -177,6 +252,18 @@ def process_rollout_data(args, rollout_data_ref, dp_rank, dp_size):
         n_samples_per_prompt = getattr(args, "n_samples_per_prompt", 1)
         # Calculate group-level lengths (sum of lengths for each group)
         num_groups = len(total_lengths) // n_samples_per_prompt
+
+        # Defensive check: ensure we have enough groups for DP partitioning
+        # This prevents cryptic assertion errors in get_seqlen_balanced_partitions
+        if num_groups < dp_size:
+            raise ValueError(
+                f"Insufficient data for DP partitioning with balance_data=True: "
+                f"got {len(total_lengths)} samples ({num_groups} groups with "
+                f"n_samples_per_prompt={n_samples_per_prompt}), but need at least "
+                f"{dp_size * n_samples_per_prompt} samples for dp_size={dp_size}. "
+                f"This usually indicates the client sent an empty or undersized batch."
+            )
+
         group_lengths = []
         for i in range(num_groups):
             start_idx = i * n_samples_per_prompt
@@ -228,5 +315,24 @@ def process_rollout_data(args, rollout_data_ref, dp_rank, dp_size):
             continue
         val = get_partition(data[key])
         rollout_data[key] = val
+
+    if "_actual_global_batch_size" in data:
+        rollout_data["_actual_global_batch_size"] = data["_actual_global_batch_size"]
+
+    # DPO forward_backward_custom uses this to switch from policy_loss to sft_loss
+    if "_loss_type_override" in data:
+        rollout_data["_loss_type_override"] = data["_loss_type_override"]
+
+    # Tinker flag for CP handling (full-size tensors from client)
+    if "_with_tinker" in data:
+        rollout_data["_with_tinker"] = data["_with_tinker"]
+
+    # Store the original indices this DP rank is responsible for
+    # Used by actor_group._aggregate_dp_results() to reorder logprobs to original order
+    total_samples = len(data["tokens"])
+    if args.balance_data:
+        rollout_data["_dp_original_indices"] = parititions[dp_rank]
+    else:
+        rollout_data["_dp_original_indices"] = list(range(dp_rank, total_samples, dp_size))
 
     return rollout_data

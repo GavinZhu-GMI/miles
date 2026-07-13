@@ -1,6 +1,6 @@
 import logging
 from argparse import Namespace
-from typing import Optional, Sequence, Union
+from collections.abc import Sequence
 
 import numpy as np
 import torch
@@ -26,7 +26,7 @@ def get_batch(
     data_iterator: "DataIterator",
     keys: Sequence[str],
     pad_multiplier: int = 128,
-) -> dict[str, Union[torch.Tensor, PackedSeqParams, list[torch.Tensor], None]]:
+) -> dict[str, torch.Tensor | PackedSeqParams | list[torch.Tensor] | None]:
     """
     Generate a CP-ready micro-batch with packed sequence parameters.
 
@@ -50,6 +50,19 @@ def get_batch(
 
     assert "tokens" in keys
     batch = data_iterator.get_next(keys)
+
+    # Debug: ALWAYS log what keys are requested and what's in batch
+    # print(f"[GET_BATCH DEBUG] requested keys: {keys}", flush=True)
+    lp = batch.get("log_probs")
+    rlp = batch.get("rollout_log_probs")
+    # print(f"[GET_BATCH DEBUG] log_probs: {'None' if lp is None else 'empty' if not lp else f'{len(lp)} samples'}", flush=True)
+    # print(f"[GET_BATCH DEBUG] rollout_log_probs: {'None' if rlp is None else 'empty' if not rlp else f'{len(rlp)} samples'}", flush=True)
+    if lp:
+        lp_sizes = [t.shape[0] if t is not None else 0 for t in lp]
+        # print(f"[GET_BATCH DEBUG] log_probs sizes: {lp_sizes}, total={sum(lp_sizes)}", flush=True)
+    if rlp:
+        rlp_sizes = [t.shape[0] if t is not None else 0 for t in rlp]
+        # print(f"[GET_BATCH DEBUG] rollout_log_probs sizes: {rlp_sizes}, total={sum(rlp_sizes)}", flush=True)
 
     packed_seq_params = None
     tokens = batch["tokens"]
@@ -91,10 +104,22 @@ def get_batch(
     batch["tokens"] = tokens
     batch["packed_seq_params"] = packed_seq_params
 
-    # Always propagate actual batch size if it exists on the rollout data (needed for variable batch sizes)
+    # Propagate scalar metadata from rollout_data (not per-sample, so not sliced by iterator)
     rollout_metadata = getattr(data_iterator, "rollout_data", None)
-    if rollout_metadata and "_actual_global_batch_size" in rollout_metadata:
-        batch["_actual_global_batch_size"] = rollout_metadata["_actual_global_batch_size"]
+    if rollout_metadata:
+        # Variable batch size support
+        if "_actual_global_batch_size" in rollout_metadata:
+            batch["_actual_global_batch_size"] = rollout_metadata["_actual_global_batch_size"]
+        # DPO forward_backward_custom loss type override
+        if "_loss_type_override" in rollout_metadata:
+            batch["_loss_type_override"] = rollout_metadata["_loss_type_override"]
+            logger.info(f"[get_batch] Set _loss_type_override to: {batch['_loss_type_override']}")
+        else:
+            logger.info(f"[get_batch] No _loss_type_override in rollout_metadata. Keys: {list(rollout_metadata.keys())}")
+        # Tinker flag for CP handling (full-size tensors from client)
+        if "_with_tinker" in rollout_metadata:
+            batch["_with_tinker"] = rollout_metadata["_with_tinker"]
+
     return batch
 
 
@@ -103,7 +128,7 @@ def gather_log_data(
     args: Namespace,
     rollout_id: int,
     log_dict: dict[str, float],
-) -> Optional[dict[str, float]]:
+) -> dict[str, float] | None:
     """
     Gather per-rank metrics, reduce by mean on the DP source rank, and log.
 
@@ -155,8 +180,8 @@ class DataIterator:
     def __init__(
         self,
         rollout_data: RolloutBatch,
-        micro_batch_size: Optional[int] = None,
-        micro_batch_indices: Optional[list[list[int]]] = None,
+        micro_batch_size: int | None = None,
+        micro_batch_indices: list[list[int]] | None = None,
     ) -> None:
         """Initialize an iterator over `rollout_data`.
 
@@ -172,7 +197,7 @@ class DataIterator:
         assert micro_batch_size is None or micro_batch_indices is None
         self.offset = 0
 
-    def get_next(self, keys: Sequence[str]) -> dict[str, Optional[list[object]]]:
+    def get_next(self, keys: Sequence[str]) -> dict[str, list[object] | None]:
         """Return the next micro-batch for the requested keys.
 
         - If `micro_batch_indices` is provided, selects rows according to the current
@@ -208,10 +233,27 @@ class DataIterator:
         self.offset = 0
         return self
 
+    def get_processing_order(self) -> list[int] | None:
+        """Return the flattened order in which samples are processed.
+
+        When using dynamic batch sizing with sequence-length balancing,
+        samples are reordered to balance token counts across microbatches.
+        This method returns the mapping from processed position to original
+        sample index.
+
+        Returns:
+            None if using contiguous microbatches (no reordering).
+            List of original indices in processing order if using micro_batch_indices.
+            E.g., [2, 3, 0, 1] means: first we process sample 2, then 3, then 0, then 1.
+        """
+        if self.micro_batch_indices is None:
+            return None
+        return [idx for partition in self.micro_batch_indices for idx in partition]
+
 
 def get_data_iterator(
     args: Namespace,
-    model: Union[torch.nn.Module, Sequence[torch.nn.Module]],
+    model: torch.nn.Module | Sequence[torch.nn.Module],
     rollout_data: RolloutBatch,
 ) -> tuple[list[DataIterator], list[int]]:
     """
@@ -242,6 +284,19 @@ def get_data_iterator(
 
     num_local_samples = len(rollout_data["total_lengths"])
 
+    # Debug: Check initial rollout_data sizes
+    if "log_probs" in rollout_data and rollout_data["log_probs"]:
+        lp_sizes = [lp.shape[0] if lp is not None else 0 for lp in rollout_data["log_probs"]]
+        # print(f"[DATA_ITER DEBUG] INITIAL rollout_data['log_probs']: {len(rollout_data['log_probs'])} samples, sizes={lp_sizes[:10]}..., total={sum(lp_sizes)}", flush=True)
+    if "rollout_log_probs" in rollout_data and rollout_data["rollout_log_probs"]:
+        rlp_sizes = [lp.shape[0] if lp is not None else 0 for lp in rollout_data["rollout_log_probs"]]
+        # print(f"[DATA_ITER DEBUG] INITIAL rollout_data['rollout_log_probs']: {len(rollout_data['rollout_log_probs'])} samples, sizes={rlp_sizes[:10]}..., total={sum(rlp_sizes)}", flush=True)
+    if "response_lengths" in rollout_data and rollout_data["response_lengths"]:
+        # print(f"[DATA_ITER DEBUG] INITIAL response_lengths: {rollout_data['response_lengths'][:10]}..., total={sum(rollout_data['response_lengths'])}", flush=True)
+        pass
+
+    # print(f"[MILES DEBUG] get_data_iterator: num_local_samples={num_local_samples}, dp_size={dp_size}, global_batch_size={args.global_batch_size}", flush=True)
+
     # FLEXIBLE BATCH SIZE: support variable batch sizes (e.g., when driven by external APIs like Tinker)
     target_local_batch_size = args.global_batch_size // dp_size
     if num_local_samples <= target_local_batch_size:
@@ -251,8 +306,13 @@ def get_data_iterator(
         num_local_gbs = target_local_batch_size
         num_steps_per_rollout = (num_local_samples + num_local_gbs - 1) // num_local_gbs
 
+    # print(f"[MILES DEBUG] target_local_batch_size={target_local_batch_size}, num_local_gbs={num_local_gbs}, num_steps_per_rollout={num_steps_per_rollout}", flush=True)
+
     # Track the effective batch size (used later for loss scaling)
-    rollout_data["_actual_global_batch_size"] = num_local_samples * dp_size
+    # Include CP because loss.py:1071 multiplies by get_data_parallel_world_size(with_context_parallel=True)
+    # which returns DP × CP, so the divisor must also include CP to balance the formula
+    if "_actual_global_batch_size" not in rollout_data:
+        rollout_data["_actual_global_batch_size"] = num_local_samples * dp_size * cp_size
 
     def _generate_data_iterator(rollout_data, micro_batch_size, micro_batch_indices=None):
         data_iterator = []
@@ -306,6 +366,8 @@ def get_data_iterator(
 
         data_iterator = _generate_data_iterator(rollout_data, None, micro_batch_indices)
 
+    # print(f"[MILES DEBUG] FINAL num_microbatches={num_microbatches}, use_dynamic_batch_size={args.use_dynamic_batch_size}", flush=True)
+
     return (
         data_iterator,
         num_microbatches,
@@ -352,6 +414,8 @@ def log_rollout_data(rollout_id: int, args: Namespace, rollout_data: RolloutBatc
                         val = val.mean() * cp_size
                 else:
                     val = sum(val) / len(val)
+            elif isinstance(val, (int, float)):
+                val = val  # Scalar types (e.g., _actual_global_batch_size)
             elif isinstance(val, torch.Tensor):
                 val = val.float().mean()
             else:
@@ -455,8 +519,8 @@ def log_perf_data(rollout_id: int, args: Namespace) -> None:
 
 def sync_actor_critic_data(
     args: Namespace,
-    rollout_data: Optional[RolloutBatch] = None,
-    group: Optional[dist.ProcessGroup] = None,
+    rollout_data: RolloutBatch | None = None,
+    group: dist.ProcessGroup | None = None,
 ) -> None:
     """
     Broadcast `values` (from critic) and optionally `log_probs`/`ref_log_probs`
@@ -485,7 +549,7 @@ def sync_actor_critic_data(
             log_probs = [torch.empty_like(value) for value in values]
         if not ref_log_probs:
             ref_log_probs = [torch.empty_like(value) for value in values]
-        for ref_log_prob, log_prob in zip(ref_log_probs, log_probs):
+        for ref_log_prob, log_prob in zip(ref_log_probs, log_probs, strict=False):
             handles.append(dist.broadcast(log_prob, src=0, group=group, async_op=True))
             handles.append(dist.broadcast(ref_log_prob, src=0, group=group, async_op=True))
 

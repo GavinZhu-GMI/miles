@@ -2,7 +2,7 @@ import argparse
 import json
 import logging
 import os
-from typing import Any, Dict
+from typing import Any
 
 import yaml
 from sglang_router.launch_router import RouterArgs
@@ -11,6 +11,8 @@ from transformers import AutoConfig
 from miles.backends.sglang_utils.arguments import add_sglang_arguments
 from miles.backends.sglang_utils.arguments import validate_args as sglang_validate_args
 from miles.utils.eval_config import EvalDatasetConfig, build_eval_dataset_configs, ensure_dataset_list
+
+from miles.utils.logging_utils import configure_logger
 
 logger = logging.getLogger(__name__)
 
@@ -131,8 +133,8 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--train-memory-margin-bytes",
                 type=int,
-                default=0,
-                help="Add margin for train memory allocation.",
+                default=1024**3,
+                help="Add margin for train memory allocation. By default we will reserve 1GB as margin.",
             )
             parser.add_argument(
                 "--disable-weights-backuper",
@@ -145,6 +147,11 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 choices=["raw", "bridge"],
                 default="raw",
                 help="The method to convert megatron weights to hugging face weights for SGLang.",
+            )
+            parser.add_argument(
+                "--recompute-loss-function",
+                action="store_true",
+                help="Whether to disable recompute loss function to save memory during training.",
             )
 
             return parser
@@ -443,6 +450,12 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
             )
 
             parser.add_argument(
+                "--data-source-path",
+                type=str,
+                default="miles.rollout.data_source.RolloutDataSourceWithBuffer",
+                help="The data source class for rollout data.",
+            )
+            parser.add_argument(
                 "--prompt-data",
                 type=str,
                 default=None,
@@ -608,7 +621,9 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
             parser.add_argument("--eval-top-p", type=float, default=None)
             parser.add_argument("--eval-top-k", type=int, default=None)
             parser.add_argument("--eval-max-response-len", type=int, default=None)
+            parser.add_argument("--eval-max-prompt-len", type=int, default=None)
             parser.add_argument("--eval-min-new-tokens", type=int, default=None)
+            parser.add_argument("--eval-max-context-len", type=int, default=None)
 
             return parser
 
@@ -718,6 +733,12 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 help="KL penalty coefficient for the loss function. This is added to the final PPO loss.",
             )
             parser.add_argument(
+                "--use-unbiased-kl",
+                action="store_true",
+                default=False,
+                help="Whether to enable unbiased KL estimation.",
+            )
+            parser.add_argument(
                 "--ref-update-interval",
                 type=int,
                 default=None,
@@ -800,6 +821,18 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 action="store_true",
                 default=False,
                 help="The rollout routing replay technique from https://arxiv.org/abs/2510.11370",
+            )
+            parser.add_argument(
+                "--use-opsm",
+                action="store_true",
+                default=False,
+                help="Whether to enable Off-Policy Sequence Masking (OPSM).",
+            )
+            parser.add_argument(
+                "--opsm-delta",
+                type=float,
+                default=1e-4,
+                help="The threshold for Off-Policy Sequence Masking (OPSM).",
             )
             return parser
 
@@ -1092,6 +1125,24 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 default=128,
                 help="Multiplier for data padding size in data processing.",
             )
+            parser.add_argument(
+                "--rollout-sample-filter-path",
+                type=str,
+                default=None,
+                help=(
+                    "Path to the rollout sample filter function. "
+                    "This function determines whether a sample will participate in loss calculation. "
+                    "The function should take args and samples (list[Sample]) as input, and return None. "
+                    "Please directly modify the remove_sample attribute of Sample. "
+                    "Note: This attribute does not determine whether the sample participates in advantage normalization."
+                ),
+            )
+            parser.add_argument(
+                "--disable-rollout-trim-samples",
+                action="store_true",
+                default=False,
+                help="disable trim samples in rollout buffer when converting samples to train data",
+            )
             return parser
 
         def add_custom_megatron_plugins_arguments(parser):
@@ -1130,6 +1181,15 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
 
             return parser
 
+        def add_prefill_decode_disaggregation_arguments(parser):
+            parser.add_argument(
+                "--prefill-num-servers",
+                type=int,
+                default=None,
+                help="Number of prefill servers for disaggregation.",
+            )
+            return parser
+
         def add_ci_arguments(parser):
             parser.add_argument(
                 "--ci-test",
@@ -1148,6 +1208,103 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 "--ci-metric-checker-threshold",
                 type=float,
                 default=None,
+            )
+            parser.add_argument(
+                "--ci-save-grad-norm",
+                type=str,
+                default=None,
+            )
+            parser.add_argument(
+                "--ci-load-grad-norm",
+                type=str,
+                default=None,
+            )
+            return parser
+
+        def add_lora_arguments(parser):
+            """Add LoRA (Low-Rank Adaptation) arguments for parameter-efficient fine-tuning."""
+            parser.add_argument(
+                "--lora-rank",
+                type=int,
+                default=0,
+                help="LoRA rank. 0 disables LoRA. Typical values: 8, 16, 32, 64.",
+            )
+            parser.add_argument(
+                "--lora-alpha",
+                type=float,
+                default=None,
+                help="LoRA alpha scaling factor. Defaults to lora_rank if not set (scaling = 1.0).",
+            )
+            parser.add_argument(
+                "--lora-dropout",
+                type=float,
+                default=0.0,
+                help="LoRA dropout rate. Default 0.0 (no dropout).",
+            )
+            parser.add_argument(
+                "--lora-checkpoint",
+                type=str,
+                default=None,
+                help="Path to LoRA checkpoint to load. If not set, LoRA adapters start from scratch.",
+            )
+            return parser
+
+        def add_rlve_arguments(parser):
+            """Add RLVE (Reinforcement Learning with Verifiable Environments) arguments."""
+            parser.add_argument(
+                "--rlve",
+                action="store_true",
+                default=False,
+                help="Enable RLVE training mode with procedurally generated verifiable environments.",
+            )
+            parser.add_argument(
+                "--environment-list",
+                type=str,
+                nargs='+',
+                default=None,
+                help=(
+                    "List of verifiable environments to train on. "
+                    "Accepts multiple string values (e.g. --environment-list Sorting Fibonacci). "
+                    "Required when --rlve is True."
+                ),
+            )
+            parser.add_argument(
+                "--initial-difficulty",
+                type=int,
+                default=0,
+                help="Initial difficulty (upper bound) for each environment.",
+            )
+            parser.add_argument(
+                "--difficulty-sliding-window-size",
+                type=int,
+                default=4,
+                help="Size of the sliding window for problem difficulty sampling.",
+            )
+            parser.add_argument(
+                "--min-metric-to-increase-difficulty",
+                type=float,
+                default=0.9,
+                help="When accuracy exceeds this value, difficulty will be increased.",
+            )
+            parser.add_argument(
+                "--min-prompts-before-difficulty-check",
+                type=int,
+                default=8,
+                help="Minimum number of prompts before performing a difficulty check.",
+            )
+            parser.add_argument(
+                "--answer-marker-type",
+                type=str,
+                default=r"\boxed{}",
+                choices=[r"\boxed{}", r"<answer></answer>"],
+                help="The type of answer marker to use for extracting answers.",
+            )
+            parser.add_argument(
+                "--custom-prompt-preprocessor",
+                type=str,
+                default=None,
+                choices=["TinyZero", "ChatTemplate_NoSystemPrompt"],
+                help="Choose a custom prompt preprocessor for RLVE.",
             )
             return parser
 
@@ -1178,7 +1335,10 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
         parser = add_reward_model_arguments(parser)
         parser = add_rollout_buffer_arguments(parser)
         parser = add_mtp_training_arguments(parser)
+        parser = add_prefill_decode_disaggregation_arguments(parser)
         parser = add_ci_arguments(parser)
+        parser = add_rlve_arguments(parser)
+        parser = add_lora_arguments(parser)
         parser.set_defaults(sglang_tensor_parallel_size=add_sglang_tp_size())
 
         # For megatron
@@ -1191,7 +1351,7 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 help="Path to the YAML config for custom function arguments.",
             )
             parser.add_argument("--padded-vocab-size", type=int, default=None)
-        except:
+        except argparse.ArgumentError:
             pass
 
         return parser
@@ -1200,6 +1360,9 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
 
 
 def parse_args(add_custom_arguments=None):
+    # Users may call `parse_args` very early, thus we ensure logger is configured here
+    configure_logger()
+
     add_miles_arguments = get_miles_extra_args_provider(add_custom_arguments)
 
     backend = parse_args_train_backend()
@@ -1263,7 +1426,7 @@ def _resolve_eval_datasets(args) -> list[EvalDatasetConfig]:
     Build evaluation dataset configurations from either --eval-config or --eval-prompt-data.
     """
     datasets_config = []
-    defaults: Dict[str, Any] = {}
+    defaults: dict[str, Any] = {}
 
     if args.eval_config:
         from omegaconf import OmegaConf
@@ -1292,7 +1455,7 @@ def _resolve_eval_datasets(args) -> list[EvalDatasetConfig]:
     else:
         datasets_config = []
 
-    eval_datasets = build_eval_dataset_configs(datasets_config, defaults)
+    eval_datasets = build_eval_dataset_configs(args, datasets_config, defaults)
     if eval_datasets:
         args.eval_prompt_data = [item for dataset in eval_datasets for item in (dataset.name, dataset.path)]
     else:
@@ -1303,6 +1466,18 @@ def _resolve_eval_datasets(args) -> list[EvalDatasetConfig]:
 
 def miles_validate_args(args):
     args.eval_datasets = _resolve_eval_datasets(args)
+
+    # LoRA validation and defaults
+    if getattr(args, "lora_rank", 0) > 0:
+        if args.lora_alpha is None:
+            args.lora_alpha = args.lora_rank  # Default: scaling = 1.0
+            logger.info(f"LoRA enabled: rank={args.lora_rank}, alpha={args.lora_alpha} (default)")
+        else:
+            logger.info(f"LoRA enabled: rank={args.lora_rank}, alpha={args.lora_alpha}")
+
+        if args.lora_checkpoint is not None:
+            if not os.path.exists(args.lora_checkpoint):
+                raise FileNotFoundError(f"LoRA checkpoint {args.lora_checkpoint} does not exist")
 
     if args.kl_coef != 0 or args.use_kl_loss:
         if not os.path.exists(args.ref_load):
@@ -1351,7 +1526,7 @@ def miles_validate_args(args):
         ), "custom_tis_function_path must be set when get_mismatch_metrics is set"
 
         if args.use_rollout_logprobs:
-            print(
+            logger.info(
                 "get_mismatch_metrics is set; For metrics calculation, the log probs will still be recomputed by training engine. One more forward pass will be applied."
             )
 
@@ -1479,17 +1654,42 @@ def miles_validate_args(args):
         args.use_routing_replay = True
 
     if args.custom_config_path:
-        with open(args.custom_config_path, "r") as f:
+        with open(args.custom_config_path) as f:
             data = yaml.safe_load(f) or {}
         for k, v in data.items():
-            if not hasattr(args, k):
-                setattr(args, k, v)
-            else:
-                logger.info(f"Warning: Argument {k} is already set to {getattr(args, k)}, will not override with {v}.")
+            if hasattr(args, k):
+                logger.info(f"Warning: Argument {k} is already set to {getattr(args, k)}, will override with {v}.")
+            setattr(args, k, v)
+
+    if args.rollout_max_context_len is None:
+        logger.info(
+            f"args.rollout_max_context_len is not set. Use args.rollout_max_response_len {args.rollout_max_response_len} as default value."
+        )
+        args.rollout_max_context_len = args.rollout_max_response_len
+
+    if args.eval_max_context_len is None:
+        logger.info(
+            f"args.eval_max_context_len is not set. Use args.rollout_max_context_len {args.rollout_max_context_len} as default value."
+        )
+        args.eval_max_context_len = args.rollout_max_context_len
+
+    if args.rollout_max_prompt_len is None:
+        logger.info(
+            f"args.rollout_max_prompt_len is not set. Use args.rollout_max_context_len - 1 ({args.rollout_max_context_len} - 1) as default value so that there is at least one generated token to compute loss."
+        )
+        args.rollout_max_prompt_len = args.rollout_max_context_len - 1
+
+    assert (
+        args.rollout_max_prompt_len <= args.rollout_max_context_len - 1
+    ), f"args.rollout_max_prompt_len ({args.rollout_max_prompt_len}) must be smaller than args.rollout_max_context_len ({args.rollout_max_context_len}) so that there is at least one generated token to compute loss."
+
+    if args.prefill_num_servers is not None:
+        assert not args.use_fault_tolerance, "fault tolerance is not supported when prefill_num_servers is set."
 
 
 def hf_validate_args(args, hf_config):
-    equal = lambda x, y: x == y
+    def equal(x, y):
+        return x == y
 
     errors = []
 
@@ -1510,10 +1710,10 @@ def hf_validate_args(args, hf_config):
                 )
 
     if len(errors) > 0:
-        raise AssertionError(f"hf_validate_args failed: " + "; ".join(errors))
+        raise AssertionError("hf_validate_args failed: " + "; ".join(errors))
 
 
-def _validate_and_update_megatron_args_from_hf(args, args_from_hf_config: Dict[str, Any]):
+def _validate_and_update_megatron_args_from_hf(args, args_from_hf_config: dict[str, Any]):
     for key, value in args_from_hf_config.items():
         if hasattr(args, key) and getattr(args, key) != value:
             raise ValueError(

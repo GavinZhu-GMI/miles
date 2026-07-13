@@ -1,4 +1,6 @@
 import asyncio
+import json
+import random
 from typing import Union
 
 import aiohttp
@@ -12,6 +14,7 @@ from .gpqa import compute_gpqa_reward
 from .math_dapo_utils import compute_score as compute_score_dapo
 from .math_utils import extract_answer as extract_boxed_answer
 from .math_utils import grade_answer_verl
+from .rlve_rm import rlve_rm
 
 
 async def remote_rm(args, sample: Sample):
@@ -58,6 +61,18 @@ async def async_rm(args, sample: Sample, **kwargs):
         from .ifbench import compute_ifbench_reward
 
         return compute_ifbench_reward(response, label, metadata=metadata)
+    elif rm_type == "random":
+        return random.randint(0, 1)
+    elif rm_type == "rlve":
+        # RLVE verifiable environments reward
+        if isinstance(metadata, str):
+            metadata = json.loads(metadata)
+        return rlve_rm(
+            args=args,
+            environment=metadata["environment"],
+            config=metadata["config"],
+            response=response
+        )
     elif rm_type:
         raise NotImplementedError(f"Rule-based RM for {rm_type} is not implemented.")
     else:
@@ -68,7 +83,7 @@ async def batched_async_rm(
     args,
     samples: list[Sample],
     **kwargs,
-) -> list[Union[int, float]]:
+) -> list[int | float]:
     if args.custom_rm_path is not None:
         # Ensure the custom reward function is implemented in batch mode
         rm_function = load_function(args.custom_rm_path)
