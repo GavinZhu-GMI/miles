@@ -377,61 +377,11 @@ def _zero_grads(model: Sequence[DDP], optimizer: MegatronOptimizer | None, disab
         optimizer.zero_grad()
 
 
-def train_one_step(
-    args: Namespace,
-    rollout_id: int,
-    step_id: int,
-    data_iterator: Sequence[DataIterator],
-    model: Sequence[DDP],
-    optimizer: MegatronOptimizer | None,
-    opt_param_scheduler: OptimizerParamScheduler | None,
-    num_microbatches: int,
-    witness_info: WitnessInfo | None,
-    attempt: int,
-    ft_test_action_executor: FTTestActionActorExecutor | None = None,
-) -> tuple[dict[str, float], float, TrainStepOutcome]:
-    """Execute a single pipeline-parallel training step.
+def _build_train_forward_step(args: Namespace, num_microbatches: int, dumper_phase_util: DumperMegatronUtil):
+    """Build the forward_step closure used by Megatron's pipeline engine.
 
-    Runs forward/backward over ``num_microbatches``, applies optimizer step and
-    one scheduler step when gradients are valid.
-
-    Multi-LoRA: gradients are retained across train calls (per-adapter
-    gradient accumulation); only the slots in the batch's ``step_slots`` step,
-    and only their gradients are zeroed.
-
-    Args:
-        args: Runtime arguments.
-        rollout_id: Rollout identifier.
-        step_id: Step index within the current rollout.
-        data_iterator: Iterable(s) yielding training batches.
-        model: Sequence of DDP-wrapped model chunks.
-        optimizer: Optimizer instance.
-        opt_param_scheduler: LR/WD scheduler.
-        num_microbatches: Number of microbatches to process.
-
-    Returns:
-        Tuple of (reduced loss dict, gradient norm, step outcome).
+    Shared by ``train_one_step`` and the Tinker seam's ``forward_backward_pass``.
     """
-    args = get_args()
-    parallel_state = get_parallel_state()
-    dumper_phase_util = DumperMegatronUtil(args, model, DumperPhase.FWD_BWD, rollout_id=rollout_id)
-    disable_optimizer = args.debug_disable_optimizer or optimizer is None
-    multi_lora = is_multi_lora_enabled(args)
-
-    if multi_lora:
-        from miles.backends.megatron_utils.multi_lora_optimizer import reset_grad_metadata_keep_grads
-
-        # Retain accumulated per-adapter gradients; reset only the per-iteration
-        # DDP bookkeeping. Slot grads are zeroed selectively at step time.
-        reset_grad_metadata_keep_grads(model)
-    else:
-        _zero_grads(model, optimizer, disable_optimizer)
-
-    if args.custom_megatron_before_train_step_hook_path:
-        from miles.utils.misc import load_function
-
-        custom_before_train_step_hook = load_function(args.custom_megatron_before_train_step_hook_path)
-        custom_before_train_step_hook(args, rollout_id, step_id, model, optimizer, opt_param_scheduler)
 
     @dumper_phase_util.wrap_forward_step
     def forward_step(data_iterator: DataIterator, model: GPTModel, return_schedule_plan: bool = False) -> tuple[
@@ -520,6 +470,67 @@ def train_one_step(
             m.stage = old_stage
 
         return output_tensor, partial(loss_function, args, batch, num_microbatches, apply_megatron_loss_scaling=True)
+
+    return forward_step
+
+
+def train_one_step(
+    args: Namespace,
+    rollout_id: int,
+    step_id: int,
+    data_iterator: Sequence[DataIterator],
+    model: Sequence[DDP],
+    optimizer: MegatronOptimizer | None,
+    opt_param_scheduler: OptimizerParamScheduler | None,
+    num_microbatches: int,
+    witness_info: WitnessInfo | None,
+    attempt: int,
+    ft_test_action_executor: FTTestActionActorExecutor | None = None,
+) -> tuple[dict[str, float], float, TrainStepOutcome]:
+    """Execute a single pipeline-parallel training step.
+
+    Runs forward/backward over ``num_microbatches``, applies optimizer step and
+    one scheduler step when gradients are valid.
+
+    Multi-LoRA: gradients are retained across train calls (per-adapter
+    gradient accumulation); only the slots in the batch's ``step_slots`` step,
+    and only their gradients are zeroed.
+
+    Args:
+        args: Runtime arguments.
+        rollout_id: Rollout identifier.
+        step_id: Step index within the current rollout.
+        data_iterator: Iterable(s) yielding training batches.
+        model: Sequence of DDP-wrapped model chunks.
+        optimizer: Optimizer instance.
+        opt_param_scheduler: LR/WD scheduler.
+        num_microbatches: Number of microbatches to process.
+
+    Returns:
+        Tuple of (reduced loss dict, gradient norm, step outcome).
+    """
+    args = get_args()
+    parallel_state = get_parallel_state()
+    dumper_phase_util = DumperMegatronUtil(args, model, DumperPhase.FWD_BWD, rollout_id=rollout_id)
+    disable_optimizer = args.debug_disable_optimizer or optimizer is None
+    multi_lora = is_multi_lora_enabled(args)
+
+    if multi_lora:
+        from miles.backends.megatron_utils.multi_lora_optimizer import reset_grad_metadata_keep_grads
+
+        # Retain accumulated per-adapter gradients; reset only the per-iteration
+        # DDP bookkeeping. Slot grads are zeroed selectively at step time.
+        reset_grad_metadata_keep_grads(model)
+    else:
+        _zero_grads(model, optimizer, disable_optimizer)
+
+    if args.custom_megatron_before_train_step_hook_path:
+        from miles.utils.misc import load_function
+
+        custom_before_train_step_hook = load_function(args.custom_megatron_before_train_step_hook_path)
+        custom_before_train_step_hook(args, rollout_id, step_id, model, optimizer, opt_param_scheduler)
+
+    forward_step = _build_train_forward_step(args, num_microbatches, dumper_phase_util)
 
     # Forward pass.
     forward_backward_func = get_forward_backward_func()
@@ -629,6 +640,131 @@ def finalize_model_grads_with_empty_cache(*args, **kwargs):
     return finalize_model_grads(*args, **kwargs)
 
 
+def _configure_train_step(
+    model: Sequence[DDP],
+    optimizer: MegatronOptimizer | None,
+    args: Namespace,
+    disable_optimizer: bool,
+):
+    """Configure the model config for a training fwd/bwd pass.
+
+    Extracted from ``train`` so the Tinker seam's ``forward_backward_pass`` can
+    reuse it. Safe to call repeatedly: the no_sync guard only asserts on the
+    first configuration (the seam reconfigures on every forward_backward call).
+    """
+    config = get_model_config(model[0])
+    config.grad_scale_func = None if disable_optimizer else optimizer.scale_loss
+    config.timers = None
+    if isinstance(model[0], DDP) and args.overlap_grad_reduce:
+        if not getattr(config, "_miles_no_sync_configured", False):
+            assert config.no_sync_func is None, (
+                "When overlap_grad_reduce is True, config.no_sync_func must be None; "
+                "a custom no_sync_func is not supported when overlapping grad-reduce"
+            )
+            config._miles_no_sync_configured = True
+        config.no_sync_func = [model_chunk.no_sync for model_chunk in model]
+        if len(model) == 1:
+            config.no_sync_func = config.no_sync_func[0]
+        if args.align_grad_reduce:
+            config.grad_sync_func = [model_chunk.start_grad_sync for model_chunk in model]
+            if len(model) == 1:
+                config.grad_sync_func = config.grad_sync_func[0]
+    if args.overlap_param_gather and args.align_param_gather:
+        config.param_sync_func = [model_chunk.start_param_sync for model_chunk in model]
+        if len(model) == 1:
+            config.param_sync_func = config.param_sync_func[0]
+    config.finalize_model_grads_func = finalize_model_grads_with_empty_cache
+    return config
+
+
+def forward_backward_pass(
+    rollout_id: int,
+    data_iterator: Sequence[DataIterator],
+    model: Sequence[DDP],
+    optimizer: MegatronOptimizer | None,
+    num_microbatches: Sequence[int],
+    zero_grads: bool = False,
+) -> dict[str, float]:
+    """Tinker seam: forward + backward WITHOUT the optimizer step.
+
+    Gradients accumulate in the DDP grad buffers across successive calls until
+    ``optimizer_step`` runs (which zeroes them). Split-invariance of the
+    accumulated gradient across calls relies on the loss normalization being
+    call-independent — the Tinker path pins it via the ``_loss_norm_total``
+    rollout key (see training_utils/loss.py); see specs/005 design.md (G1).
+    """
+    args = get_args()
+    disable_optimizer = args.debug_disable_optimizer or optimizer is None
+
+    for iterator in data_iterator:
+        iterator.reset()
+    for model_module in model:
+        model_module.train()
+
+    _configure_train_step(model, optimizer, args, disable_optimizer)
+
+    if zero_grads:
+        for model_chunk in model:
+            model_chunk.zero_grad_buffer()
+        if not disable_optimizer:
+            optimizer.zero_grad()
+
+    forward_backward_func = get_forward_backward_func()
+    losses_reduced = []
+    for num_mbs in num_microbatches:
+        dumper_phase_util = DumperMegatronUtil(args, model, DumperPhase.FWD_BWD, rollout_id=rollout_id)
+        forward_step = _build_train_forward_step(args, num_mbs, dumper_phase_util)
+        losses_reduced += forward_backward_func(
+            forward_step_func=forward_step,
+            data_iterator=data_iterator,
+            model=model,
+            num_microbatches=num_mbs,
+            seq_length=args.seq_length,
+            micro_batch_size=args.micro_batch_size,
+            decoder_seq_length=args.decoder_seq_length,
+            forward_only=False,
+        )
+
+    if mpu.is_pipeline_last_stage(ignore_virtual=True):
+        return aggregate_train_losses(losses_reduced)
+    return {}
+
+
+def optimizer_step(
+    model: Sequence[DDP],
+    optimizer: MegatronOptimizer | None,
+    opt_param_scheduler: OptimizerParamScheduler | None,
+    learning_rate: float | None = None,
+) -> dict[str, float | bool]:
+    """Tinker seam: apply the optimizer over gradients accumulated by
+    ``forward_backward_pass``, then release them.
+
+    When ``learning_rate`` is given the client owns the LR schedule: it is set
+    directly on the param groups and the Megatron scheduler is NOT stepped
+    (single-owner rule, specs/005 design.md).
+    """
+    args = get_args()
+    if optimizer is None:
+        return {"success": False, "grad_norm": 0.0}
+
+    if learning_rate is not None:
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = learning_rate * param_group.get("lr_mult", 1.0)
+
+    update_successful, grad_norm, _ = optimizer.step()
+
+    if update_successful and learning_rate is None and opt_param_scheduler is not None:
+        opt_param_scheduler.step(increment=args.global_batch_size)
+
+    for model_chunk in model:
+        model_chunk.zero_grad_buffer()
+    optimizer.zero_grad()
+
+    if isinstance(grad_norm, torch.Tensor):
+        grad_norm = grad_norm.item()
+    return {"success": bool(update_successful), "grad_norm": float(grad_norm) if grad_norm is not None else 0.0}
+
+
 def train(
     rollout_id: int,
     model: Sequence[DDP],
@@ -665,26 +801,7 @@ def train(
         model_module.train()
 
     # Setup some training config params.
-    config = get_model_config(model[0])
-    config.grad_scale_func = None if disable_optimizer else optimizer.scale_loss
-    config.timers = None
-    if isinstance(model[0], DDP) and args.overlap_grad_reduce:
-        assert config.no_sync_func is None, (
-            "When overlap_grad_reduce is True, config.no_sync_func must be None; "
-            "a custom no_sync_func is not supported when overlapping grad-reduce"
-        )
-        config.no_sync_func = [model_chunk.no_sync for model_chunk in model]
-        if len(model) == 1:
-            config.no_sync_func = config.no_sync_func[0]
-        if args.align_grad_reduce:
-            config.grad_sync_func = [model_chunk.start_grad_sync for model_chunk in model]
-            if len(model) == 1:
-                config.grad_sync_func = config.grad_sync_func[0]
-    if args.overlap_param_gather and args.align_param_gather:
-        config.param_sync_func = [model_chunk.start_param_sync for model_chunk in model]
-        if len(model) == 1:
-            config.param_sync_func = config.param_sync_func[0]
-    config.finalize_model_grads_func = finalize_model_grads_with_empty_cache
+    config = _configure_train_step(model, optimizer, args, disable_optimizer)
 
     pre_hook_enabled = False
 

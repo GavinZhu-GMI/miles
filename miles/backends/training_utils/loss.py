@@ -136,7 +136,7 @@ def loss_function(
         batch.get("max_seq_lens", None),
     )
 
-    func = get_loss_function(args)
+    func = get_loss_function(args, batch.get("_loss_type_override"))
 
     if args.recompute_loss_function:
         loss, log = checkpoint(
@@ -161,6 +161,10 @@ def loss_function(
     # is applied to the accumulated slot gradient at optimizer-step time.
     if is_multi_lora_enabled(args):
         global_batch_size = 1
+    # Tinker seam: explicit normalization override. _loss_norm_total=1 gives
+    # pure-sum gradients, which are invariant to how a logical batch is split
+    # across forward_backward calls (G1). Takes precedence when present.
+    global_batch_size = batch.get("_loss_norm_total", global_batch_size)
     if not args.calculate_per_token_loss:
         if apply_megatron_loss_scaling:
             loss_parallel_size = (
