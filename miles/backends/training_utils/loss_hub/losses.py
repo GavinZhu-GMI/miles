@@ -476,8 +476,11 @@ def sft_loss_function(
     )
 
 
-def get_loss_function(args: Namespace) -> LossFunction:
-    match args.loss_type:
+def get_loss_function(args: Namespace, loss_type: str | None = None) -> LossFunction:
+    # loss_type overrides args.loss_type when given (the Tinker seam selects
+    # the loss per request via the _loss_type_override rollout key).
+    loss_type = loss_type or args.loss_type
+    match loss_type:
         case "policy_loss":
             return policy_loss_function
         case "value_loss":
@@ -487,4 +490,4 @@ def get_loss_function(args: Namespace) -> LossFunction:
         case "custom_loss":
             return load_function(args.custom_loss_function_path)
         case _:
-            raise ValueError(f"Unknown loss type: {args.loss_type}")
+            raise ValueError(f"Unknown loss type: {loss_type}")

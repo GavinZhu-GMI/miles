@@ -274,4 +274,8 @@ def process_rollout_data_shard(args, rollout_data):
     Timer().seq_lens = total_lengths
     rollout_data["total_lengths"] = [total_lengths[i] for i in partition]
 
+    # Tinker seam: keep this rank's original sample indices so per-sample
+    # outputs can be reassembled into the client's submission order.
+    rollout_data["_partition_indices"] = list(partition)
+
     return rollout_data
