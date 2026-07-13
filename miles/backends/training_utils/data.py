@@ -151,6 +151,12 @@ def get_batch(
     if "dynamic_global_batch_size" in data_iterator.rollout_data:
         batch["dynamic_global_batch_size"] = data_iterator.rollout_data["dynamic_global_batch_size"]
 
+    # Tinker seam: forward per-request scalar metadata to the loss layer
+    # (same pattern as dynamic_global_batch_size above).
+    for tinker_key in ("_loss_type_override", "_loss_norm_total"):
+        if tinker_key in data_iterator.rollout_data:
+            batch[tinker_key] = data_iterator.rollout_data[tinker_key]
+
     # No-op safety net if batches reach get_batch without rollout-level preprocessing.
     expand_multimodal_rollout_data_in_place(batch, qkv_format=qkv_format)
 

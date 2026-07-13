@@ -134,7 +134,7 @@ def loss_function(
         batch.get("max_seq_lens", None),
     )
 
-    func = get_loss_function(args)
+    func = get_loss_function(args, batch.get("_loss_type_override"))
 
     if args.recompute_loss_function:
         loss, log = checkpoint(
@@ -154,6 +154,10 @@ def loss_function(
     # Here we need to divide by cp_size because to cancel the multiply in Megatron.
     assert args.use_dynamic_global_batch_size == ("dynamic_global_batch_size" in batch)
     global_batch_size = batch.get("dynamic_global_batch_size", args.global_batch_size)
+    # Tinker seam: explicit normalization override. _loss_norm_total=1 gives
+    # pure-sum gradients, which are invariant to how a logical batch is split
+    # across forward_backward calls (specs/005 design.md, G1).
+    global_batch_size = batch.get("_loss_norm_total", global_batch_size)
     if not args.calculate_per_token_loss:
         if apply_megatron_loss_scaling:
             loss_parallel_size = (
