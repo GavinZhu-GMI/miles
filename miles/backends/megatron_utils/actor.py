@@ -676,7 +676,12 @@ class MegatronTrainRayActor(TrainRayActor):
 
     @with_logs
     def forward_backward_only(self, rollout_id: int, rollout_data_ref: Box) -> dict:
-        """Forward + backward WITHOUT the optimizer step; grads accumulate."""
+        """Forward + backward WITHOUT the optimizer step; grads accumulate.
+
+        Also returns per-sample response log-probs (Tinker's fb contract).
+        Computed via a forward-only pass on the same (pre-step) weights; can
+        later be extracted from the loss pass itself to save a forward.
+        """
         self._heartbeat.bump()
         if self.args.offload_train:
             self.wake_up()
@@ -686,12 +691,19 @@ class MegatronTrainRayActor(TrainRayActor):
 
         data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
 
+        log_probs_result = self.compute_log_prob(data_iterator, num_microbatches, rollout_id=rollout_id)
+        log_probs = log_probs_result.get("log_probs") or []
+
+        for iterator in data_iterator:
+            iterator.reset()
+
         with timer("forward_backward_only"):
             loss_dict = forward_backward_pass(
                 rollout_id, data_iterator, self.model, self.optimizer, num_microbatches
             )
 
         return {
+            "log_probs": [t.cpu() for t in log_probs],
             "loss": loss_dict,
             "partition_indices": rollout_data.get("_partition_indices", []),
         }
