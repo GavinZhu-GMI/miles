@@ -227,8 +227,9 @@ RUN if [ "${ENABLE_CUDA_13}" = "1" ]; then \
 
 # ====================================== Install main package ============================================
 
+ARG MILES_REPO=https://github.com/radixark/miles.git
 ARG MILES_COMMIT=main
-RUN git clone https://github.com/radixark/miles.git /root/miles && \
+RUN git clone ${MILES_REPO} /root/miles && \
     cd /root/miles && \
     git checkout ${MILES_COMMIT} && \
     pip install -e . --no-deps
