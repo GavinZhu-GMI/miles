@@ -50,7 +50,15 @@ from .ft.in_memory_checkpoint import InMemoryCheckpointManager
 from .ft.indep_dp import reconfigure_indep_dp_group
 from .initialize import init, is_first_replica_megatron_main_rank
 from .lora_utils import is_lora_enabled
-from .model import TrainStepOutcome, forward_only, initialize_model_and_optimizer, save, train
+from .model import (
+    TrainStepOutcome,
+    forward_backward_pass,
+    forward_only,
+    initialize_model_and_optimizer,
+    optimizer_step,
+    save,
+    train,
+)
 from .parallel import verify_megatron_parallel_state
 from .replay_utils import register_replay_list_moe
 from .update_weight.common import named_params_and_buffers
@@ -660,6 +668,89 @@ class MegatronTrainRayActor(TrainRayActor):
 
         self.weights_backuper.backup(model_tag)
         self._active_model_tag = model_tag
+
+    # --- Tinker seam -------------------------------------------------------
+    # Decoupled train-step primitives for the Tinker API (specs/005 in
+    # tinker-nemorl): N x forward_backward_only accumulate gradients, one
+    # apply_optimizer_step applies them with a per-call LR.
+
+    @with_logs
+    def forward_backward_only(self, rollout_id: int, rollout_data_ref: Box) -> dict:
+        """Forward + backward WITHOUT the optimizer step; grads accumulate."""
+        self._heartbeat.bump()
+        if self.args.offload_train:
+            self.wake_up()
+
+        with timer("data_preprocess"):
+            rollout_data = get_rollout_data(self.args, rollout_data_ref, witness_info=None)
+
+        data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
+
+        with timer("forward_backward_only"):
+            loss_dict = forward_backward_pass(
+                rollout_id, data_iterator, self.model, self.optimizer, num_microbatches
+            )
+
+        return {
+            "loss": loss_dict,
+            "partition_indices": rollout_data.get("_partition_indices", []),
+        }
+
+    @with_logs
+    def apply_optimizer_step(self, learning_rate: float | None = None) -> dict:
+        """Apply the optimizer over accumulated grads; optional per-call LR."""
+        with timer("apply_optimizer_step"):
+            result = optimizer_step(
+                self.model, self.optimizer, self.opt_param_scheduler, learning_rate=learning_rate
+            )
+
+        if result["success"] and self._enable_weight_backup:
+            self.weights_backuper.backup("actor")
+        self._heartbeat.bump()
+        return result
+
+    @with_logs
+    def forward_logprobs(self, rollout_id: int, rollout_data_ref: Box) -> dict:
+        """Forward-only per-sample log-probs (no grad); client order restored
+        via partition_indices by the fanout layer."""
+        self._heartbeat.bump()
+        if self.args.offload_train:
+            self.wake_up()
+
+        with timer("data_preprocess"):
+            rollout_data = get_rollout_data(self.args, rollout_data_ref, witness_info=None)
+
+        data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
+        result = self.compute_log_prob(data_iterator, num_microbatches, rollout_id=rollout_id)
+
+        log_probs = result.get("log_probs") or []
+        return {
+            "log_probs": [t.cpu() for t in log_probs],
+            "partition_indices": rollout_data.get("_partition_indices", []),
+        }
+
+    @with_logs
+    def load_checkpoint(self, checkpoint_path: str) -> dict:
+        """Full resume (model + optimizer + scheduler) from checkpoint_path."""
+        old_args = self.args.load, self.args.no_load_optim, self.args.no_load_rng, self.args.finetune
+        self.args.load = checkpoint_path
+        self.args.no_load_optim = False
+        self.args.no_load_rng = False
+        self.args.finetune = False
+        try:
+            iteration, _ = load_checkpoint(
+                self.model,
+                self.optimizer,
+                self.opt_param_scheduler,
+                checkpointing_context={},
+                skip_load_to_model_and_opt=False,
+            )
+        finally:
+            self.args.load, self.args.no_load_optim, self.args.no_load_rng, self.args.finetune = old_args
+
+        if self._enable_weight_backup:
+            self.weights_backuper.backup("actor")
+        return {"success": True, "iteration": iteration}
 
     @with_logs
     def connect_actor_critic(
