@@ -692,7 +692,7 @@ def forward_backward_pass(
     all-reduce) is DEFERRED to ``optimizer_step``: reducing per fb call
     rewrites local grads with reduced shards, corrupting the buffer as an
     accumulation substrate (measured as a ~1/sqrt(2) grad-norm regression on
-    bridge-LoRA; specs/005 design.md R1). This mirrors megatron's own
+    bridge-LoRA). This mirrors megatron's own
     microbatch accumulation, which syncs only on the final pass.
     """
     args = get_args()
@@ -752,7 +752,7 @@ def optimizer_step(
 
     When ``learning_rate`` is given the client owns the LR schedule: it is set
     directly on the param groups and the Megatron scheduler is NOT stepped
-    (single-owner rule, specs/005 design.md).
+    (single-owner rule: exactly one of client/scheduler drives the LR).
     """
     args = get_args()
     if optimizer is None:
