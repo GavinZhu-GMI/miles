@@ -670,8 +670,8 @@ class MegatronTrainRayActor(TrainRayActor):
         self._active_model_tag = model_tag
 
     # --- Tinker seam -------------------------------------------------------
-    # Decoupled train-step primitives for the Tinker API (specs/005 in
-    # tinker-nemorl): N x forward_backward_only accumulate gradients, one
+    # Decoupled train-step primitives for the Tinker API:
+    # N x forward_backward_only accumulate gradients, one
     # apply_optimizer_step applies them with a per-call LR.
 
     @with_logs

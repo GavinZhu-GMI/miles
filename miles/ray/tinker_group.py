@@ -1,5 +1,5 @@
 # Tinker seam: RayTrainGroup extension exposing decoupled train-step
-# primitives for the Tinker API (specs/005 in tinker-nemorl). Additive only —
+# primitives for the Tinker API. Additive only —
 # the frozen v1 RayTrainGroup is untouched; this subclass rides its
 # _broadcast fanout. Pattern: N x forward_backward_only accumulate gradients
 # on the actors, then one apply_optimizer_step applies them (per-call LR).
