@@ -156,7 +156,7 @@ def loss_function(
     global_batch_size = batch.get("dynamic_global_batch_size", args.global_batch_size)
     # Tinker seam: explicit normalization override. _loss_norm_total=1 gives
     # pure-sum gradients, which are invariant to how a logical batch is split
-    # across forward_backward calls (specs/005 design.md, G1).
+    # across forward_backward calls.
     global_batch_size = batch.get("_loss_norm_total", global_batch_size)
     if not args.calculate_per_token_loss:
         if apply_megatron_loss_scaling:
