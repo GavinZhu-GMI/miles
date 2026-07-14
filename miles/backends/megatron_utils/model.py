@@ -646,11 +646,13 @@ def forward_backward_pass(
 ) -> dict[str, float]:
     """Tinker seam: forward + backward WITHOUT the optimizer step.
 
-    Gradients accumulate in the DDP grad buffers across successive calls until
-    ``optimizer_step`` runs (which zeroes them). Split-invariance of the
-    accumulated gradient across calls relies on the loss normalization being
-    call-independent — the Tinker path pins it via the ``_loss_norm_total``
-    rollout key (see training_utils/loss.py); see specs/005 design.md (G1).
+    Gradients accumulate LOCALLY in the DDP grad buffers across successive
+    calls until ``optimizer_step`` runs. DP grad finalization (reduce-scatter/
+    all-reduce) is DEFERRED to ``optimizer_step``: reducing per fb call
+    rewrites local grads with reduced shards, corrupting the buffer as an
+    accumulation substrate (measured as a ~1/sqrt(2) grad-norm regression on
+    bridge-LoRA; specs/005 design.md R1). This mirrors megatron's own
+    microbatch accumulation, which syncs only on the final pass.
     """
     args = get_args()
     disable_optimizer = args.debug_disable_optimizer or optimizer is None
@@ -660,7 +662,7 @@ def forward_backward_pass(
     for model_module in model:
         model_module.train()
 
-    _configure_train_step(model, optimizer, args, disable_optimizer)
+    config = _configure_train_step(model, optimizer, args, disable_optimizer)
 
     if zero_grads:
         for model_chunk in model:
@@ -670,23 +672,32 @@ def forward_backward_pass(
 
     forward_backward_func = get_forward_backward_func()
     losses_reduced = []
-    for num_mbs in num_microbatches:
-        dumper_phase_util = DumperMegatronUtil(args, model, DumperPhase.FWD_BWD, rollout_id=rollout_id)
-        forward_step = _build_train_forward_step(args, num_mbs, dumper_phase_util)
-        losses_reduced += forward_backward_func(
-            forward_step_func=forward_step,
-            data_iterator=data_iterator,
-            model=model,
-            num_microbatches=num_mbs,
-            seq_length=args.seq_length,
-            micro_batch_size=args.micro_batch_size,
-            decoder_seq_length=args.decoder_seq_length,
-            forward_only=False,
-        )
+    config.finalize_model_grads_func = _skip_finalize_model_grads
+    try:
+        for num_mbs in num_microbatches:
+            dumper_phase_util = DumperMegatronUtil(args, model, DumperPhase.FWD_BWD, rollout_id=rollout_id)
+            forward_step = _build_train_forward_step(args, num_mbs, dumper_phase_util)
+            losses_reduced += forward_backward_func(
+                forward_step_func=forward_step,
+                data_iterator=data_iterator,
+                model=model,
+                num_microbatches=num_mbs,
+                seq_length=args.seq_length,
+                micro_batch_size=args.micro_batch_size,
+                decoder_seq_length=args.decoder_seq_length,
+                forward_only=False,
+            )
+    finally:
+        config.finalize_model_grads_func = finalize_model_grads_with_empty_cache
 
     if mpu.is_pipeline_last_stage(ignore_virtual=True):
         return aggregate_train_losses(losses_reduced)
     return {}
+
+
+def _skip_finalize_model_grads(*args, **kwargs):
+    """No-op finalize for the Tinker seam's fb passes (deferred to step)."""
+    return None
 
 
 def optimizer_step(
@@ -709,6 +720,10 @@ def optimizer_step(
     if learning_rate is not None:
         for param_group in optimizer.param_groups:
             param_group["lr"] = learning_rate * param_group.get("lr_mult", 1.0)
+
+    # Deferred DP grad finalization for everything forward_backward_pass
+    # accumulated locally (see its docstring).
+    finalize_model_grads_with_empty_cache(list(model), None)
 
     update_successful, grad_norm, _ = optimizer.step()
 
