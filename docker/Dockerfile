@@ -16,7 +16,12 @@ FROM lmsysorg/sglang:${SGLANG_IMAGE_TAG} AS sglang
 # ======================================== Arguments =============================================
 
 ARG SGLANG_BRANCH=sglang-miles
-ARG SGLANG_COMMIT=""
+# Pinned by SHA, not branch tip: sglang-miles moves, and FETCH_HEAD builds are
+# unreproducible. This SHA is the branch tip carrying the multi-LoRA fixes
+# (sgl-project/sglang#32376 one-sided expert-target warning, #32421
+# load_lora_adapter_from_distributed under dp attention). Empty string restores
+# the branch-tip behavior.
+ARG SGLANG_COMMIT=3003d70f680d41c59d1b7acbf65cb47795dfd19e
 
 ARG MEGATRON_REPO=radixark/Megatron-LM
 ARG MEGATRON_BRANCH=miles-main
