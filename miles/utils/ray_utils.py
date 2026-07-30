@@ -12,7 +12,13 @@ class Box:
 
 
 def compute_ray_pin_head_options():
-    head_node_id = _get_head_node_id()
+    # The state API cannot resolve the head under a ray:// client connection
+    # (its helper calls ray.init again); head pinning is an ops nicety, so
+    # degrade to default scheduling instead of failing the caller.
+    try:
+        head_node_id = _get_head_node_id()
+    except Exception:
+        return {}
     return {
         "scheduling_strategy": NodeAffinitySchedulingStrategy(
             node_id=head_node_id,
