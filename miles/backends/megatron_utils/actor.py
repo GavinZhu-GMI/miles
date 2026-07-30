@@ -792,26 +792,27 @@ class MegatronTrainRayActor(TrainRayActor):
             self.wake_up()
 
         with timer("data_preprocess"):
-            rollout_data = get_rollout_data(self.args, rollout_data_ref, witness_info=None)
+            rollout_data, store_get_result = get_rollout_data(self.args, rollout_data_ref, witness_info=None)
 
-        data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
+        with store_get_result:
+            data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
 
-        log_probs_result = self.compute_log_prob(data_iterator, num_microbatches, rollout_id=rollout_id)
-        log_probs = log_probs_result.get("log_probs") or []
+            log_probs_result = self.compute_log_prob(data_iterator, num_microbatches, rollout_id=rollout_id)
+            log_probs = log_probs_result.get("log_probs") or []
 
-        for iterator in data_iterator:
-            iterator.reset()
+            for iterator in data_iterator:
+                iterator.reset()
 
-        with timer("forward_backward_only"):
-            loss_dict = forward_backward_pass(
-                rollout_id, data_iterator, self.model, self.optimizer, num_microbatches
-            )
+            with timer("forward_backward_only"):
+                loss_dict = forward_backward_pass(
+                    rollout_id, data_iterator, self.model, self.optimizer, num_microbatches
+                )
 
-        return {
-            "log_probs": [t.cpu() for t in log_probs],
-            "loss": loss_dict,
-            "partition_indices": rollout_data.get("_partition_indices", []),
-        }
+            return {
+                "log_probs": [t.cpu() for t in log_probs],
+                "loss": loss_dict,
+                "partition_indices": rollout_data.get("_partition_indices", []),
+            }
 
     @with_logs
     def apply_optimizer_step(self, learning_rate: float | None = None) -> dict:
@@ -835,16 +836,17 @@ class MegatronTrainRayActor(TrainRayActor):
             self.wake_up()
 
         with timer("data_preprocess"):
-            rollout_data = get_rollout_data(self.args, rollout_data_ref, witness_info=None)
+            rollout_data, store_get_result = get_rollout_data(self.args, rollout_data_ref, witness_info=None)
 
-        data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
-        result = self.compute_log_prob(data_iterator, num_microbatches, rollout_id=rollout_id)
+        with store_get_result:
+            data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
+            result = self.compute_log_prob(data_iterator, num_microbatches, rollout_id=rollout_id)
 
-        log_probs = result.get("log_probs") or []
-        return {
-            "log_probs": [t.cpu() for t in log_probs],
-            "partition_indices": rollout_data.get("_partition_indices", []),
-        }
+            log_probs = result.get("log_probs") or []
+            return {
+                "log_probs": [t.cpu() for t in log_probs],
+                "partition_indices": rollout_data.get("_partition_indices", []),
+            }
 
     @with_logs
     def load_checkpoint(self, checkpoint_path: str) -> dict:
