@@ -165,6 +165,11 @@ def loss_function(
     # pure-sum gradients, which are invariant to how a logical batch is split
     # across forward_backward calls. Takes precedence when present.
     global_batch_size = batch.get("_loss_norm_total", global_batch_size)
+    # Multi-LoRA + seam must agree on pure-sum (both resolve to 1 today);
+    # per-slot step-time normalization double-counts otherwise.
+    assert not (is_multi_lora_enabled(args) and global_batch_size != 1), (
+        f"multi-LoRA requires pure-sum loss normalization; got _loss_norm_total={global_batch_size}"
+    )
     if not args.calculate_per_token_loss:
         if apply_megatron_loss_scaling:
             loss_parallel_size = (

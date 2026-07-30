@@ -51,6 +51,26 @@ class AdapterRunConfig:
 
 
 @dataclass(frozen=True)
+class TinkerAdapterConfig:
+    """Client-driven (Tinker) adapter: no server-side data source, reward
+    model, or stopping rule — the tenant's program is the loop.
+
+    Deliberately NOT an AdapterRunConfig subclass: resolve_adapter_config
+    requires a data path for run-spec adapters and must keep bypassing this
+    type. Duck-typed against the loader/push surface (.rank/.alpha/.save)
+    and the scheduler install (.num_step/.adapter_global_batch_size — the
+    installed schedule is warmup-then-hold and never stepped: the client
+    sets LR per optim call)."""
+
+    rank: int
+    alpha: int
+    save: str | Path | None = None
+    num_step: int | None = None
+    adapter_global_batch_size: int = 1
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class AdapterRun:
     """Read-only join view of a run's static config and current slot."""
 

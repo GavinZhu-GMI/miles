@@ -35,16 +35,36 @@ class TinkerTrainGroup(RayTrainGroup):
         """Fan out fwd+bwd (no optimizer step) to all actors."""
         return await self._broadcast("forward_backward_only", rollout_id, rollout_data_ref)
 
-    async def apply_optimizer_step(self, learning_rate: float | None = None):
+    async def apply_optimizer_step(
+        self,
+        learning_rate: float | None = None,
+        adapter_slot: int | None = None,
+        adapter_name: str | None = None,
+    ):
         """Apply the optimizer over accumulated grads on all actors.
 
+        With ``adapter_slot``, steps exactly that multi-LoRA slot (and marks
+        ``adapter_name`` for the next per-adapter weight push).
         Returns one {"success", "grad_norm"} dict per actor.
         """
-        return await self._broadcast("apply_optimizer_step", learning_rate=learning_rate)
+        return await self._broadcast(
+            "apply_optimizer_step",
+            learning_rate=learning_rate,
+            adapter_slot=adapter_slot,
+            adapter_name=adapter_name,
+        )
 
-    async def apply_optimizer_step_and_sync(self, learning_rate: float | None = None, rollout_id=None):
+    async def apply_optimizer_step_and_sync(
+        self,
+        learning_rate: float | None = None,
+        rollout_id=None,
+        adapter_slot: int | None = None,
+        adapter_name: str | None = None,
+    ):
         """Optimizer step + push updated weights to the inference engines."""
-        results = await self.apply_optimizer_step(learning_rate=learning_rate)
+        results = await self.apply_optimizer_step(
+            learning_rate=learning_rate, adapter_slot=adapter_slot, adapter_name=adapter_name
+        )
         await self.update_weights(rollout_id)
         return results
 

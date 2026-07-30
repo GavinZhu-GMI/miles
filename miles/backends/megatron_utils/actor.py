@@ -815,12 +815,30 @@ class MegatronTrainRayActor(TrainRayActor):
             }
 
     @with_logs
-    def apply_optimizer_step(self, learning_rate: float | None = None) -> dict:
-        """Apply the optimizer over accumulated grads; optional per-call LR."""
+    def apply_optimizer_step(
+        self,
+        learning_rate: float | None = None,
+        adapter_slot: int | None = None,
+        adapter_name: str | None = None,
+    ) -> dict:
+        """Apply the optimizer over accumulated grads; optional per-call LR.
+
+        With ``adapter_slot`` (multi-LoRA pool), steps exactly that slot and
+        marks its adapter stale for the next weight push (all ranks agree:
+        the fanout drives every actor with the same arguments)."""
         with timer("apply_optimizer_step"):
-            result = optimizer_step(
-                self.model, self.optimizer, self.opt_param_scheduler, learning_rate=learning_rate
-            )
+            if adapter_slot is not None:
+                from .model import optimizer_step_adapter
+
+                result = optimizer_step_adapter(
+                    self.model, self.optimizer, adapter_slot, learning_rate=learning_rate
+                )
+                if result["success"] and adapter_name is not None:
+                    self._multi_lora_pending_push.add(adapter_name)
+            else:
+                result = optimizer_step(
+                    self.model, self.optimizer, self.opt_param_scheduler, learning_rate=learning_rate
+                )
 
         if result["success"] and self._enable_weight_backup:
             self.weights_backuper.backup("actor")

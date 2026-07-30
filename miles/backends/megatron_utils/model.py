@@ -687,16 +687,22 @@ def forward_backward_pass(
 ) -> dict[str, float]:
     """Tinker seam: forward + backward WITHOUT the optimizer step.
 
-    Gradients accumulate LOCALLY in the DDP grad buffers across successive
-    calls until ``optimizer_step`` runs. DP grad finalization (reduce-scatter/
-    all-reduce) is DEFERRED to ``optimizer_step``: reducing per fb call
-    rewrites local grads with reduced shards, corrupting the buffer as an
-    accumulation substrate (measured as a ~1/sqrt(2) grad-norm regression on
-    bridge-LoRA). This mirrors megatron's own
-    microbatch accumulation, which syncs only on the final pass.
+    Single-adapter: gradients accumulate LOCALLY in the DDP grad buffers
+    across successive calls until ``optimizer_step`` runs. DP grad
+    finalization (reduce-scatter/all-reduce) is DEFERRED to
+    ``optimizer_step``: reducing per fb call rewrites local grads with
+    reduced shards, corrupting the buffer as an accumulation substrate
+    (measured as a ~1/sqrt(2) grad-norm regression on bridge-LoRA). This
+    mirrors megatron's own microbatch accumulation, which syncs only on the
+    final pass.
+
+    Multi-LoRA: the opposite — finalize runs per call (upstream behavior),
+    grads are retained per slot, and ``optimizer_step_adapter`` steps one
+    slot with no further DP reduce.
     """
     args = get_args()
     disable_optimizer = args.debug_disable_optimizer or optimizer is None
+    multi_lora = is_multi_lora_enabled(args)
 
     for iterator in data_iterator:
         iterator.reset()
@@ -705,7 +711,7 @@ def forward_backward_pass(
 
     config = _configure_train_step(model, optimizer, args, disable_optimizer)
 
-    if zero_grads:
+    if zero_grads and not multi_lora:
         for model_chunk in model:
             model_chunk.zero_grad_buffer()
         if not disable_optimizer:
@@ -713,9 +719,19 @@ def forward_backward_pass(
 
     forward_backward_func = get_forward_backward_func()
     losses_reduced = []
-    config.finalize_model_grads_func = _skip_finalize_model_grads
+    # Multi-LoRA keeps the per-call finalize: plain-DDP all-reduce is
+    # idempotent on retained (rank-identical) content, and the per-slot step
+    # does no DP reduce of its own. Deferring it (the single-adapter path
+    # below) is a distributed-optimizer artifact; dist-opt is off here.
+    if not multi_lora:
+        config.finalize_model_grads_func = _skip_finalize_model_grads
     try:
         for num_mbs in num_microbatches:
+            if multi_lora:
+                from miles.backends.megatron_utils.multi_lora_optimizer import reset_grad_metadata_keep_grads
+
+                # Per-call boundary: reset DDP bookkeeping, retain slot grads.
+                reset_grad_metadata_keep_grads(model)
             dumper_phase_util = DumperMegatronUtil(args, model, DumperPhase.FWD_BWD, rollout_id=rollout_id)
             forward_step = _build_train_forward_step(args, num_mbs, dumper_phase_util)
             losses_reduced += forward_backward_func(
@@ -778,6 +794,33 @@ def optimizer_step(
     if isinstance(grad_norm, torch.Tensor):
         grad_norm = grad_norm.item()
     return {"success": bool(update_successful), "grad_norm": float(grad_norm) if grad_norm is not None else 0.0}
+
+
+def optimizer_step_adapter(
+    model: Sequence[DDP],
+    optimizer: MegatronOptimizer | None,
+    slot: int,
+    learning_rate: float | None = None,
+) -> dict[str, float | bool]:
+    """Tinker seam, multi-LoRA: step exactly one adapter slot over its
+    retained accumulated gradients, with a per-call LR set directly on the
+    slot's param groups (the client owns the schedule; per-slot schedulers
+    are not consulted). Batch size 1 keeps the pure-sum contract: the client
+    owns sample weighting, no server-side rescale. Other slots' grads are
+    untouched; only the stepped slot's are zeroed."""
+    args = get_args()
+    if optimizer is None:
+        return {"success": False, "grad_norm": 0.0}
+
+    from miles.backends.megatron_utils.multi_lora_optimizer import _slot_children, step_adapter_slots
+
+    if learning_rate is not None:
+        for child in _slot_children(optimizer, slot):
+            for param_group in child.param_groups:
+                param_group["lr"] = learning_rate * param_group.get("lr_mult", 1.0)
+
+    grad_norms = step_adapter_slots(optimizer, model, {slot: 1}, args.clip_grad)
+    return {"success": True, "grad_norm": float(grad_norms.get(slot, 0.0))}
 
 
 def train(
