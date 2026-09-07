@@ -73,6 +73,7 @@ class TinkerTrainGroup(RayTrainGroup):
         results = await self._broadcast("forward_logprobs", rollout_id, rollout_data_ref)
         return merge_dp_sample_outputs(results, key="log_probs")
 
-    async def load_checkpoint(self, checkpoint_path: str):
-        """Full resume (model + optimizer + scheduler) on all actors."""
-        return await self._broadcast("load_checkpoint", checkpoint_path)
+    async def load_checkpoint(self, checkpoint_path: str, load_optimizer: bool = True):
+        """Load checkpoint_path on all actors: weights only (fresh optimizer,
+        RNG and iteration), or the full resume with optimizer + scheduler."""
+        return await self._broadcast("load_checkpoint", checkpoint_path, load_optimizer)
