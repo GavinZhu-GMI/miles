@@ -867,18 +867,24 @@ class MegatronTrainRayActor(TrainRayActor):
             }
 
     @with_logs
-    def load_checkpoint(self, checkpoint_path: str) -> dict:
-        """Full resume (model + optimizer + scheduler) from checkpoint_path."""
+    def load_checkpoint(self, checkpoint_path: str, load_optimizer: bool = True) -> dict:
+        """Load checkpoint_path into this actor.
+
+        load_optimizer=True is the full resume (model + optimizer + scheduler +
+        RNG, iteration restored). load_optimizer=False loads the model weights
+        only: Megatron's --no-load-optim / --no-load-rng / --finetune, so the
+        optimizer keeps its current state and the iteration count resets.
+        """
         old_args = self.args.load, self.args.no_load_optim, self.args.no_load_rng, self.args.finetune
         self.args.load = checkpoint_path
-        self.args.no_load_optim = False
-        self.args.no_load_rng = False
-        self.args.finetune = False
+        self.args.no_load_optim = not load_optimizer
+        self.args.no_load_rng = not load_optimizer
+        self.args.finetune = not load_optimizer
         try:
             iteration, _ = load_checkpoint(
                 self.model,
-                self.optimizer,
-                self.opt_param_scheduler,
+                self.optimizer if load_optimizer else None,
+                self.opt_param_scheduler if load_optimizer else None,
                 checkpointing_context={},
                 skip_load_to_model_and_opt=False,
             )
