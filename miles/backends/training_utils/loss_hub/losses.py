@@ -180,6 +180,12 @@ def policy_loss_function(
     pg_loss, pg_clipfrac = compute_policy_loss(
         ppo_kl, advantages, args.eps_clip, args.eps_clip_high, getattr(args, "eps_clip_c", None)
     )
+    # Tinker seam: client per-token weights ride beside the 0/1 mask, not in it.
+    # They scale every per-token term of the loss; logged metrics stay unweighted.
+    loss_weights = None
+    if batch.get("loss_weights") is not None:
+        loss_weights = torch.cat(batch["loss_weights"], dim=0).to(pg_loss)
+        pg_loss = pg_loss * loss_weights
 
     if getattr(args, "dump_details", None) is not None:
         from miles.backends.training_utils.debug_dump import maybe_dump_policy_loss_debug
@@ -278,7 +284,8 @@ def policy_loss_function(
         entropy = torch.cat(entropy, dim=0)
         entropy_loss = sum_of_sample_mean(entropy)
         if args.entropy_coef != 0:
-            loss = pg_loss - args.entropy_coef * entropy_loss
+            entropy_term = sum_of_sample_mean(entropy * loss_weights) if loss_weights is not None else entropy_loss
+            loss = pg_loss - args.entropy_coef * entropy_term
         else:
             entropy_loss = entropy_loss.detach()
 
@@ -302,7 +309,8 @@ def policy_loss_function(
         kl_loss = sum_of_sample_mean(kl)
 
         if args.kl_loss_coef != 0:
-            loss = loss + args.kl_loss_coef * kl_loss
+            kl_term = sum_of_sample_mean(kl * loss_weights) if loss_weights is not None else kl_loss
+            loss = loss + args.kl_loss_coef * kl_term
 
     # make sure the gradient could backprop correctly.
     if log_probs.numel() == 0:
@@ -462,6 +470,9 @@ def sft_loss_function(
 
     log_probs = log_probs_and_entropy["log_probs"]
     log_probs = torch.cat(log_probs, dim=0)
+    # Tinker seam: client per-token weights ride beside the 0/1 mask, not in it.
+    if batch.get("loss_weights") is not None:
+        log_probs = log_probs * torch.cat(batch["loss_weights"], dim=0).to(log_probs)
     loss = -sum_of_sample_mean(log_probs)
 
     # make sure the gradient could backprop correctly.

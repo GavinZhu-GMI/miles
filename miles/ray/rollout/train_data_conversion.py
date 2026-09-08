@@ -247,6 +247,7 @@ def split_train_data_by_dp_raw(args, data: dict[str, Any], *, dp_size: int) -> l
             "advantages",
             "returns",
             "values",
+            "loss_weights",
         ]:
             if key not in data:
                 continue
