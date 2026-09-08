@@ -127,11 +127,18 @@ def loss_function(
     num_tokens = sum([torch.clamp_min(loss_mask.sum(), 1) for loss_mask in batch["loss_masks"]])
     num_samples = len(batch["response_lengths"])
 
+    # Tinker seam: the client's contract is a per-token SUM (weights inside the
+    # mask, advantages inside the term). Use the token reducer, but keep the
+    # sample-count normalization branch below so Megatron never divides by
+    # num_tokens at finalize (that would make each fb call its own mean and
+    # break split-invariance).
+    seam_pure_sum = "_loss_norm_total" in batch
+
     sum_of_sample_mean = get_sum_of_sample_mean(
         batch["total_lengths"],
         batch["response_lengths"],
         batch["loss_masks"],
-        args.calculate_per_token_loss,
+        args.calculate_per_token_loss or seam_pure_sum,
         args.qkv_format,
         batch.get("max_seq_lens", None),
     )
@@ -162,15 +169,16 @@ def loss_function(
     if is_multi_lora_enabled(args):
         global_batch_size = 1
     # Tinker seam: explicit normalization override. _loss_norm_total=1 gives
-    # pure-sum gradients, which are invariant to how a logical batch is split
-    # across forward_backward calls. Takes precedence when present.
+    # pure-sum gradients (sum over datums of the token reducer above), which
+    # are invariant to how a logical batch is split across forward_backward
+    # calls. Takes precedence when present.
     global_batch_size = batch.get("_loss_norm_total", global_batch_size)
     # Multi-LoRA + seam must agree on pure-sum (both resolve to 1 today);
     # per-slot step-time normalization double-counts otherwise.
     assert not (is_multi_lora_enabled(args) and global_batch_size != 1), (
         f"multi-LoRA requires pure-sum loss normalization; got _loss_norm_total={global_batch_size}"
     )
-    if not args.calculate_per_token_loss:
+    if seam_pure_sum or not args.calculate_per_token_loss:
         if apply_megatron_loss_scaling:
             loss_parallel_size = (
                 parallel_state.intra_dp.size
@@ -186,12 +194,12 @@ def loss_function(
 
     return (
         loss,
-        torch.tensor(num_tokens if args.calculate_per_token_loss else 1, device=logits.device),
+        torch.tensor(num_tokens if (args.calculate_per_token_loss and not seam_pure_sum) else 1, device=logits.device),
         {
             "keys": list(log.keys()),
             "values": torch.tensor(
                 [
-                    num_samples if not args.calculate_per_token_loss else num_tokens,
+                    num_samples if (seam_pure_sum or not args.calculate_per_token_loss) else num_tokens,
                 ]
                 + list(log.values()),
                 device=logits.device,
