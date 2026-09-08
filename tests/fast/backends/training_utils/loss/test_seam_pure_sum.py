@@ -1,8 +1,9 @@
 """Tinker seam reduction.
 
 With `_loss_norm_total` in the batch every datum contributes a token SUM over
-its mask (client weights ride in the mask, advantages in the term), the
-normalizer handed to Megatron is 1, and the log count stays the sample count.
+its 0/1 mask, client per-token weights multiply the term through the separate
+`loss_weights` key, the normalizer handed to Megatron is 1, and the log count
+stays the sample count.
 Without the key the native sample-mean path is untouched (the snapshot tests
 cover its values).
 """
@@ -38,10 +39,10 @@ def _build(loss_type: str):
     return args, inputs
 
 
-def _run(args, inputs, loss_type, masks=None, seam=True):
+def _run(args, inputs, loss_type, weights=None, seam=True):
     batch = make_batch(inputs, loss_type)
-    if masks is not None:
-        batch["loss_masks"] = masks
+    if weights is not None:
+        batch["loss_weights"] = weights
     if seam:
         batch["_loss_norm_total"] = 1
     loss, normalizer, log = loss_function(args, batch, 1, deep_clone(inputs["policy_logits"]))
@@ -70,29 +71,37 @@ def test_seam_reduces_each_datum_by_token_sum(loss_type):
     assert int(log["values"][0]) == len(batch["response_lengths"])
 
 
+def _weights(inputs, per_datum):
+    return [torch.full_like(m, float(per_datum[i])) for i, m in enumerate(inputs["loss_masks"])]
+
+
 @pytest.mark.parametrize("loss_type", ["sft_loss", "policy_loss"])
 def test_seam_is_linear_in_client_weights(loss_type):
-    # Doubling one datum's weights adds exactly that datum's contribution once
-    # more; a per-datum mean would leave the loss unchanged.
+    # Doubling one datum's weight adds exactly that datum's contribution once
+    # more; a weight of 1/2 halves it exactly. The mask is untouched.
     args, inputs = _build(loss_type)
-    base, *_ = _run(args, inputs, loss_type)
-    doubled_masks = deep_clone(inputs["loss_masks"])
-    doubled_masks[0] = doubled_masks[0] * 2
-    doubled, *_ = _run(args, inputs, loss_type, masks=doubled_masks)
-    only0_masks = [m if i == 0 else torch.zeros_like(m) for i, m in enumerate(inputs["loss_masks"])]
-    only0, *_ = _run(args, inputs, loss_type, masks=only0_masks)
+    base, *_ = _run(args, inputs, loss_type, weights=_weights(inputs, [1, 1, 1]))
+    doubled, *_ = _run(args, inputs, loss_type, weights=_weights(inputs, [2, 1, 1]))
+    only0, *_ = _run(args, inputs, loss_type, weights=_weights(inputs, [1, 0, 0]))
+    half0, *_ = _run(args, inputs, loss_type, weights=_weights(inputs, [0.5, 0, 0]))
     assert only0.abs().item() > 0
     torch.testing.assert_close(doubled - base, only0)
+    torch.testing.assert_close(half0, only0 / 2)
 
 
-def test_seam_zero_mask_datum_is_inert():
+def test_seam_zero_weight_datum_is_inert():
     args, inputs = _build("sft_loss")
-    base, *_ = _run(args, inputs, "sft_loss")
-    without2_masks = [torch.zeros_like(m) if i == 2 else m for i, m in enumerate(inputs["loss_masks"])]
-    without2, *_ = _run(args, inputs, "sft_loss", masks=without2_masks)
-    only2_masks = [m if i == 2 else torch.zeros_like(m) for i, m in enumerate(inputs["loss_masks"])]
-    only2, *_ = _run(args, inputs, "sft_loss", masks=only2_masks)
+    base, *_ = _run(args, inputs, "sft_loss", weights=_weights(inputs, [1, 1, 1]))
+    without2, *_ = _run(args, inputs, "sft_loss", weights=_weights(inputs, [1, 1, 0]))
+    only2, *_ = _run(args, inputs, "sft_loss", weights=_weights(inputs, [0, 0, 1]))
     torch.testing.assert_close(without2 + only2, base)
+
+
+def test_seam_without_weights_equals_unit_weights():
+    args, inputs = _build("sft_loss")
+    plain, *_ = _run(args, inputs, "sft_loss")
+    unit, *_ = _run(args, inputs, "sft_loss", weights=_weights(inputs, [1, 1, 1]))
+    torch.testing.assert_close(plain, unit)
 
 
 @pytest.mark.parametrize("loss_type", ["sft_loss", "policy_loss"])

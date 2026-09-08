@@ -410,6 +410,7 @@ def _build_train_forward_step(args: Namespace, num_microbatches: int, dumper_pha
                 "total_lengths",
                 "response_lengths",
                 "loss_masks",
+                "loss_weights",
                 "log_probs",
                 "ref_log_probs",
                 "values",

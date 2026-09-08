@@ -50,15 +50,12 @@ def get_rollout_data(
     rollout_data["tokens"] = [
         torch.tensor(t, dtype=torch.long, device=torch.cuda.current_device()) for t in rollout_data["tokens"]
     ]
-    # Native masks are 0/1 ints. Under the tinker seam the mask carries the
-    # client's per-token weights, so it must stay float or fractions truncate to 0.
-    mask_dtype = torch.float32 if "_loss_norm_total" in rollout_data else torch.int
     rollout_data["loss_masks"] = [
-        torch.tensor(t, dtype=mask_dtype, device=torch.cuda.current_device()) for t in rollout_data["loss_masks"]
+        torch.tensor(t, dtype=torch.int, device=torch.cuda.current_device()) for t in rollout_data["loss_masks"]
     ]
     # Client-supplied per-token RL tensors (tinker seam) arrive on CPU; the
     # native path computes these on-actor. Loss math assumes one device.
-    for _key in ("log_probs", "ref_log_probs", "advantages", "values", "returns"):
+    for _key in ("log_probs", "ref_log_probs", "advantages", "values", "returns", "loss_weights"):
         if rollout_data.get(_key):
             rollout_data[_key] = [
                 (
